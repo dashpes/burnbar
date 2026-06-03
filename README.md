@@ -11,6 +11,18 @@ menu bar — visual *and* text:
 It reads Claude Code's own local transcripts and shows how hard you're leaning on
 the active block. No `ccusage`, no API keys, no network, no pricing tables.
 
+Click it and you get a full **Stats-style dropdown** with SF Symbol section
+headers:
+
+- **Current 5-hour block** — burn, % of peak, reset countdown, live tokens/min
+  burn rate, projected end-of-block total, input/output/cache breakdown, model split
+- **Today** — total, messages, sessions, peak hour, an hourly sparkline, by model
+- **Last 7 days** — per-day mini bars, week total, month total
+- **All time** — totals, raw vs effective tokens, sessions, projects, daily
+  average, 24-hour activity sparkline, by model, by project, top sessions
+- **Records** — peak block ever, busiest day, the calibrated 100% baseline
+- **Recent blocks** — the last 10 rolling windows, live one highlighted
+
 ## How it works
 
 - Reads `~/.claude/projects/**/*.jsonl` (Claude Code's local session transcripts).
