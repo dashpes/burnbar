@@ -1,84 +1,75 @@
 # burnbar
 
-A [SwiftBar](https://swiftbar.app) plugin that renders your **current Claude Code
-5-hour usage block** as a literal progress bar that fills up, right in the macOS
-menu bar — visual *and* text:
+A [SwiftBar](https://swiftbar.app) plugin that shows your **real Claude Code
+usage limits** — the same numbers the `/usage` command shows — as a progress bar
+that fills up, right in the macOS menu bar, with a live reset countdown:
 
 ```
-███████▍░░ 74% · 1.8M
+███▉░ 37% · 3h09m
 ```
 
-It reads Claude Code's own local transcripts and shows how hard you're leaning on
-the active block. No `ccusage`, no API keys, no network, no pricing tables.
+It pulls Anthropic's live `rate_limits` (5-hour, 7-day, Opus) and pairs them with
+rich token stats from your own local transcripts. No `ccusage`, no API keys, no
+network calls, no pricing tables — nothing leaves your machine.
 
-Click it and you get a full **Stats-style dropdown** with SF Symbol section
-headers:
+![burnbar](docs/screenshot.png)
 
-- **Current 5-hour block** — burn, % of peak, reset countdown, live tokens/min
-  burn rate, projected end-of-block total, input/output/cache breakdown, model split
-- **Today** — total, messages, sessions, peak hour, an hourly sparkline, by model
-- **Last 7 days** — per-day mini bars, week total, month total
+Click it for a **Stats-style dropdown** with SF Symbol section headers:
+
+- **Usage limits (live)** — 5-hour / 7-day / Opus, each a fill bar with exact
+  `used_percentage` and time-to-reset, straight from Anthropic (cross-surface)
+- **Today** — total tokens, messages, sessions, peak hour, hourly sparkline, by model
+- **Last 7 days** — per-day mini bars, week + month totals
 - **All time** — totals, raw vs effective tokens, sessions, projects, daily
   average, 24-hour activity sparkline, by model, by project, top sessions
-- **Records** — peak block ever, busiest day, the calibrated 100% baseline
-- **Recent blocks** — the last 10 rolling windows, live one highlighted
+- **Records** — busiest 5-hour block ever, busiest day
+- **Recent blocks** — your latest rolling windows, the live one highlighted
+- **Settings** — view, theme, menu-bar trailer & width (no JSON editing)
 
-## Live usage (real limits, not estimates)
+## How the live limits work
 
-By default the bar is a token-based *estimate* from local transcripts. But
-burnbar can also show your **real** usage limits — the same numbers the `/usage`
-command shows — pulled straight from Anthropic:
-
-- **5-hour**, **7-day**, and **Opus** limits as exact `used_percentage`
-- **Exact reset times** (`resets_at`)
-- **Cross-surface**: Anthropic computes these server-side, so they already
-  include claude.ai web, Claude Code, and every machine you use
-
-Claude Code only exposes this via its **statusLine** (a command it feeds a JSON
-blob on each UI update). `burnbar-statusline.py` captures that `rate_limits`
-object to `~/.config/burnbar/usage.json` and prints a compact status line back:
+The real numbers aren't in any file that `ccusage`-style tools read — Claude Code
+only exposes them through its **statusLine** (a command it feeds a JSON blob on
+every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
+`~/.config/burnbar/usage.json` and prints a compact status line back to Claude
+Code:
 
 ```
 5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
 ```
 
-`install.sh` offers to wire this for you. Manual setup — add to
+`install.sh` offers to wire it for you. Manual setup — add to
 `~/.claude/settings.json`:
 
 ```json
 "statusLine": { "type": "command", "command": "/abs/path/to/burnbar-statusline.py", "padding": 0 }
 ```
 
-When live data is present, the menu bar bar shows your true 5-hour `%` and the
-dropdown gains a **USAGE LIMITS · live** section. It updates whenever you use
-Claude Code on this Mac (the values are global, so it stays accurate); when idle
-it shows the last-known reading with an "as of" time. No live data? burnbar
-falls back to the auto-calibrated token estimate below.
+Because Anthropic computes the limits server-side, the captured values already
+include claude.ai web, Claude Code, and every machine you use — and the reset
+times are exact. They refresh whenever you use Claude Code on this Mac; when
+idle, burnbar shows the last-known reading with an "as of" time. Until the
+bridge is wired, the menu bar shows `set up` and points you here.
 
 > Everything stays on your machine — the bridge only writes a local file. No
 > network calls, no token handling (Claude Code already holds the OAuth token).
 
 ## How it works
 
-- Reads `~/.claude/projects/**/*.jsonl` (Claude Code's local session transcripts).
-- Sums the token usage on every assistant turn (`input`, `output`,
-  `cache_creation`, `cache_read`), deduped by message id + request id.
-- Groups turns into rolling **5-hour blocks** — the same way usage limits reset.
-- The menu bar shows the **active** block: a fill bar, a `%`, and a compact token
-  count, colored green → yellow → orange → red as it climbs.
-- The dropdown breaks down input/output/cache, model split, reset countdown,
-  today's total, last 7 days, and recent blocks.
+- **Live limits** come from Anthropic via the statusLine bridge above —
+  `rate_limits` (5-hour / 7-day / Opus) with exact reset times. The menu bar `%`
+  *is* your real 5-hour usage; no estimation involved.
+- **Token stats** are read from `~/.claude/projects/**/*.jsonl` (Claude Code's
+  local transcripts): every assistant turn's `input` / `output` /
+  `cache_creation` / `cache_read`, deduped by message id + request id, grouped
+  into rolling 5-hour blocks and rolled up by day / model / project / session.
+- The menu bar fill bar is colored green → yellow → orange → red as it climbs,
+  followed by a reset countdown (swap to a token count or nothing in Settings).
 
-### What "100%" means
-
-100% is **auto-calibrated** to your busiest-ever 5-hour block — a self-tuning
-high-water mark persisted to `~/.config/burnbar/state.json`. No plan limit or
-dollar figure needed; the gauge gets more accurate the more you use it. Until you
-build up history it's anchored to a `PEAK_FLOOR` (300K effective tokens).
-
-Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) since they're far
-lighter than fresh tokens — this makes the bar track real burn rather than cache
-reuse. Set it to `1.0` in the script to count every token equally.
+Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the token
+stats, since they're far lighter than fresh tokens — this makes "effective
+tokens" track real burn rather than cache reuse. Set it to `1.0` to count every
+token equally.
 
 ## Settings (no JSON editing)
 
