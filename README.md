@@ -116,6 +116,8 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 - **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
 - **Context window** — how the *Context* section sizes each bar: `Auto-detect`,
   `200K`, or `1M` (see below)
+- **Check for updates** — `Daily` (default; a version-only GET to GitHub, see
+  [Updating](#updating)) or `Off` (no network calls at all)
 
 ## How the live limits work
 
