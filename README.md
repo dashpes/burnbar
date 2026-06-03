@@ -103,10 +103,10 @@ The real numbers aren't in any file that `ccusage`-style tools read — Claude C
 only exposes them through its **statusLine** (a command it feeds a JSON blob on
 every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
 `~/.config/burnbar/usage.json` and prints a compact status line back to Claude
-Code:
+Code, led by the session's own title so you can tell which terminal/tab is which:
 
 ```
-5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
+Add context tracking to burnbar  5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
 ```
 
 `install.sh` offers to wire it for you. Manual setup — add to

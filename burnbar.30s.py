@@ -25,6 +25,7 @@ items in the Settings submenu (which re-invoke this script with --set).
 import glob
 import json
 import os
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -35,7 +36,7 @@ PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
 CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
-CACHE_VERSION = 4                # bumped: per-file aggregates now carry context info
+CACHE_VERSION = 5                # bumped: per-file aggregates now carry context info
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -50,6 +51,8 @@ CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
 CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
 CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
+CONTEXT_NAME_W = 32              # name column width (titles truncated to fit the tree)
+CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
 MONO = "Menlo"
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
@@ -361,15 +364,19 @@ def parse_file(fp, project, session, tz):
                 o = json.loads(line)
             except Exception:
                 continue
-            if not meta and o.get("sessionId"):
-                # First line carries the session header: cwd (true project), the
-                # parent sessionId (== own id for a main session, parent's for a
-                # subagent), agentId, the sidechain flag that marks subagents, and
-                # the git branch (a cheap differentiator between sibling sessions).
-                meta = {"cwd": o.get("cwd"), "sid": o.get("sessionId"),
-                        "agent_id": o.get("agentId"),
-                        "sidechain": bool(o.get("isSidechain")),
-                        "branch": o.get("gitBranch")}
+            # Session header fields, captured from whichever early line carries
+            # each (they're not all on line 1 — e.g. `cwd` first shows up on the
+            # opening user event, after the `mode` line that has only sessionId).
+            # cwd = true project; sid = own id for a main session / parent's for a
+            # subagent; agentId + sidechain mark subagents; gitBranch differentiates
+            # sibling sessions.
+            if "cwd" not in meta and o.get("cwd"):
+                meta["cwd"] = o.get("cwd")
+                meta["branch"] = o.get("gitBranch")
+            if "sid" not in meta and o.get("sessionId"):
+                meta["sid"] = o.get("sessionId")
+                meta["agent_id"] = o.get("agentId")
+                meta["sidechain"] = bool(o.get("isSidechain"))
             if o.get("type") == "ai-title":
                 # Claude names each session (the title shown in the resume picker);
                 # it's revised over the session, so keep the most recent one.
@@ -608,8 +615,8 @@ def ctx_session_label(sv):
 
 
 def ctx_row(sv, now_ts, mode, agent=False):
-    """One agent's context-window fill. The bar/numbers lead in fixed columns so
-    rows line up; the (variable-length) session title trails."""
+    """One agent's context-window fill, as a tree row: the (truncated) name leads
+    so subagents nest visibly under their parent; bar + numbers + freshness follow."""
     win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
     used = sv.get("last_ctx", 0)
     frac = used / win if win else 0.0
@@ -618,29 +625,76 @@ def ctx_row(sv, now_ts, mode, agent=False):
     when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
     if agent:
         aid = (sv.get("agent_id") or "")[:4]
-        label = f"↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
+        name = f"  ↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
     else:
-        label = ctx_session_label(sv)
-    uw = f"{compact(used)}/{ctx_label(win)}"
-    emit(f"{render_bar(frac, 6)} {pct:>3}% {uw:<9}{when:>6}  {ellipsis(label, 32)}",
-         color=adaptive(color_for(pct)))
+        name = ctx_session_label(sv)
+    emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} {render_bar(frac, 6)} "
+         f"{pct:>3}% {compact(used):>5}/{ctx_label(win)} · {when}",
+         color=adaptive(color_for(pct)), size=CONTEXT_TEXT_SIZE)
+
+
+def live_session_cwds():
+    """Working dirs that have a live Claude Code CLI session, with a count of how
+    many — found by inspecting running `claude` processes (their cwd is the only
+    reliable 'this session is open' signal; the transcript isn't held open and
+    carries no pid). Returns {cwd: count}, {} if none are running, or None if we
+    couldn't look (so the caller can fall back to a time-based guess)."""
+    try:
+        pids = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
+                              capture_output=True, text=True, timeout=2).stdout.split()
+    except Exception:
+        return None
+    counts = {}
+    for pid in pids:
+        try:
+            out = subprocess.run(["/usr/sbin/lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+                                 capture_output=True, text=True, timeout=2).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            if line.startswith("n"):
+                cwd = os.path.normpath(line[1:])
+                counts[cwd] = counts.get(cwd, 0) + 1
+                break
+    return counts
 
 
 def emit_context(by_session, now, cfg):
     """Per-agent context-window usage, so you can see at a glance how much room is
-    left in each running session. 'Agents' = recently-active main sessions plus the
-    subagents they spawned (linked by sessionId), sorted by recency."""
+    left in each running session. 'Agents' = the open main sessions (one per live
+    `claude` process) plus the subagents they're currently running."""
     mode = cfg["context_window"]
     now_ts = now.timestamp()
-    main_cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+    proc = live_session_cwds()
+
+    def norm(sv):
+        return os.path.normpath(sv.get("cwd") or "")
+
+    # Main sessions: prefer the precise process signal — for each working dir show
+    # the N most-recently-active sessions where N = live `claude` processes there,
+    # so closed sessions can't linger. If we can't read processes, fall back to a
+    # recency window.
+    cand = sorted((kv for kv in by_session.items()
+                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
+                  key=lambda kv: -kv[1]["mtime"])
+    if proc is None:
+        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
+    else:
+        budget = dict(proc)
+        mains = []
+        for k, v in cand:
+            c = norm(v)
+            if budget.get(c, 0) > 0:
+                mains.append((k, v))
+                budget[c] -= 1
+
+    # Subagents: only ones still running (tight window), in a live working dir.
     agent_cut = now_ts - CONTEXT_AGENT_MIN * 60
-    mains = sorted(((k, v) for k, v in by_session.items()
-                    if not v.get("agent") and v.get("last_ctx", 0) > 0
-                    and v.get("mtime", 0) >= main_cut),
-                   key=lambda kv: -kv[1]["mtime"])
     agents = sorted(((k, v) for k, v in by_session.items()
                      if v.get("agent") and v.get("last_ctx", 0) > 0
-                     and v.get("mtime", 0) >= agent_cut),
+                     and v.get("mtime", 0) >= agent_cut
+                     and (proc is None or norm(v) in proc)),
                     key=lambda kv: -kv[1]["mtime"])
     if not mains and not agents:
         return
@@ -655,7 +709,8 @@ def emit_context(by_session, now, cfg):
             ctx_row(av, now_ts, mode, agent=True)
             shown_agents.add(ak)
         if len(kids) > CONTEXT_MAX_AGENTS:
-            emit(f"{'':>29}↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED)
+            emit(f"  ↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
+                 size=CONTEXT_TEXT_SIZE)
 
     shown_agents = set()
     for key, sv in mains[:CONTEXT_MAX_ROWS]:
