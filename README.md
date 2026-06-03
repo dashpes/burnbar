@@ -10,7 +10,9 @@ that fills up, right in the macOS menu bar, with a live reset countdown:
 
 It pulls Anthropic's live `rate_limits` (5-hour, 7-day, Opus) and pairs them with
 rich token stats from your own local transcripts. No `ccusage`, no API keys, no
-network calls, no pricing tables — nothing leaves your machine.
+pricing tables, no telemetry — your usage never leaves your machine. (The lone
+exception: an optional once-a-day check to GitHub for a newer version — it sends
+nothing about you, and it's one toggle away in Settings.)
 
 <p align="center">
   <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
@@ -78,6 +80,24 @@ ln -sf "$PWD/burnbar.30s.py" ~/.swiftbar/burnbar.30s.py
 open "swiftbar://refreshallplugins"
 ```
 </details>
+
+## Updating
+
+burnbar checks GitHub for a newer version **at most once a day** (a plain
+version-only GET — nothing about your usage is sent). When one is out, an
+**Update to x.y.z** row appears at the top of the dropdown; clicking it opens a
+Terminal and updates in place — `git pull` for a checkout, or a re-run of
+`install.sh` for a `curl` install — then refreshes SwiftBar.
+
+Don't want the check? Flip **Settings → Check for updates → Off**; burnbar then
+makes no network calls at all. You can always update by hand:
+
+```sh
+# checkout install
+cd /path/to/burnbar && git pull && ./install.sh
+# curl install
+curl -fsSL https://raw.githubusercontent.com/dashpes/burnbar/main/install.sh | bash -s -- -y
+```
 
 The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 `burnbar.10s.py`, etc. to taste. Works with [xbar](https://xbarapp.com) too.

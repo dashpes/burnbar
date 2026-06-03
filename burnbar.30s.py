@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.5.0</bitbar.version>
+# <bitbar.version>0.6.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -25,6 +25,7 @@ items in the Settings submenu (which re-invoke this script with --set).
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -36,7 +37,13 @@ PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
 CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
+UPDATE_PATH = os.path.expanduser("~/.config/burnbar/update.json")  # daily update check
 CACHE_VERSION = 5                # bumped: per-file aggregates now carry context info
+
+VERSION = "0.6.0"                # keep in sync with the <bitbar.version> header above
+UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
+RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
+    "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -65,6 +72,7 @@ DEFAULTS = {
     "title_size": 11,            # menu-bar font size
     "menubar_extra": "countdown",  # trailer after the %: countdown | tokens | none
     "context_window": "auto",    # how to size the context bar: auto | 200k | 1m
+    "update_check": "on",        # daily "is there a newer burnbar?" check: on | off
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 CONTEXT_WINDOWS = ("auto", "200k", "1m")
@@ -111,6 +119,8 @@ def load_config():
         cfg["menubar_extra"] = "countdown"
     if cfg.get("context_window") not in CONTEXT_WINDOWS:
         cfg["context_window"] = "auto"
+    if cfg.get("update_check") not in ("on", "off"):
+        cfg["update_check"] = "on"
     return cfg
 
 
@@ -284,6 +294,73 @@ def load_usage():
     return None
 
 
+# ─────────────────────────── update check ───────────────────────────
+def version_tuple(s):
+    """'0.6.0' -> (0, 6, 0); any non-numeric part becomes 0 so compares stay total."""
+    out = []
+    for p in (s or "").split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def fetch_latest_version():
+    """Read just the header of the published plugin and return its <bitbar.version>,
+    or None on any failure. This is the only network call burnbar makes — a plain
+    version GET to GitHub; no usage data ever leaves the machine."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{RAW_BASE}/burnbar.30s.py",
+            headers={"Range": "bytes=0-2047", "User-Agent": "burnbar"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            head = r.read(2048).decode("utf-8", "replace")
+    except Exception:
+        return None
+    m = re.search(r"<bitbar\.version>([^<]+)</bitbar\.version>", head)
+    return m.group(1).strip() if m else None
+
+
+def check_update(cfg, now_epoch):
+    """Return the newer version string if one is available, else None. Refreshes
+    from GitHub at most once a day (the result is cached in update.json); stamps the
+    check time on every attempt so a failure still waits a full day before retrying.
+    Off entirely when the user disables the check."""
+    if cfg.get("update_check") != "on":
+        return None
+    state = {}
+    try:
+        with open(UPDATE_PATH) as f:
+            state = json.load(f)
+    except Exception:
+        pass
+    if now_epoch - state.get("checked", 0) >= UPDATE_INTERVAL:
+        latest = fetch_latest_version()
+        state = {"checked": now_epoch, "latest": latest or state.get("latest")}
+        try:
+            os.makedirs(os.path.dirname(UPDATE_PATH), exist_ok=True)
+            with open(UPDATE_PATH, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+    latest = state.get("latest")
+    if latest and version_tuple(latest) > version_tuple(VERSION):
+        return latest
+    return None
+
+
+def update_command():
+    """How to pull the newest version, matched to how burnbar was installed: a git
+    checkout updates in place; a curl install re-runs the installer (which re-fetches
+    the scripts and refreshes SwiftBar)."""
+    here = os.path.dirname(SELF)
+    if os.path.isdir(os.path.join(here, ".git")):
+        return f"git -C '{here}' pull --ff-only && open 'swiftbar://refreshallplugins'"
+    return f"curl -fsSL '{RAW_BASE}/install.sh' | bash -s -- -y"
+
+
 PLAN_LABEL = {"pro": "Pro", "max5": "Max 5×", "max20": "Max 20×"}
 PLAN = None  # set in main() from ~/.claude.json
 
@@ -315,7 +392,7 @@ def pretty_project(dirname):
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
 def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
-         action=None, args=None, open_path=None, header=False):
+         action=None, args=None, open_path=None, header=False, terminal=False):
     prefix = "--" * sub
     params = [f"font={MONO} size={12 if header else size}"]
     params.append(f"color={color if color is not None else TH['text']}")
@@ -327,7 +404,7 @@ def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
         params.append(f"bash={action}")
         for i, a in enumerate(args or [], 1):
             params.append(f'param{i}="{a}"')
-        params.append("terminal=false")
+        params.append(f"terminal={'true' if terminal else 'false'}")
     if open_path:
         params.append("bash=/usr/bin/open")
         params.append(f'param1="{open_path}"')
@@ -337,6 +414,15 @@ def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
 
 def sep(sub=0):
     print("--" * sub + "---")
+
+
+def emit_update(latest):
+    """A prominent 'a newer burnbar exists' row that updates in place when clicked
+    (opens Terminal so the pull/install is visible)."""
+    emit(f"Update to {latest} (on {VERSION})", color=adaptive(TH["grad"][0]),
+         sfimage="arrow.down.circle.fill",
+         action="/bin/bash", args=["-lc", update_command()], terminal=True)
+    sep()
 
 
 # ─────────────────────────── data load ───────────────────────────
@@ -736,6 +822,7 @@ def main():
 
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
+    update_avail = check_update(cfg, now_epoch)
     tz = datetime.now().astimezone().tzinfo
     today = datetime.now().astimezone(tz).date()
     window = timedelta(hours=BLOCK_HOURS)
@@ -756,6 +843,8 @@ def main():
             print(f"{render_bar(0, cells)} | font={MONO} size={title_size} color={MUTED}")
             sep()
             emit("No Claude Code usage found yet")
+        if update_avail:
+            emit_update(update_avail)
         emit("Refresh", refresh=True)
         settings_menu(cfg)
         return
@@ -805,6 +894,9 @@ def main():
         print(f"{render_bar(0, cells)} set up | "
               f"font={MONO} size={title_size} color={MUTED}")
     sep()
+
+    if update_avail:
+        emit_update(update_avail)
 
     # ════════════════ LIVE LIMITS (real, from Anthropic) ════════════════
     if usage:
@@ -959,6 +1051,11 @@ def settings_menu(cfg):
     for opt, lbl in (("auto", "Auto-detect"), ("200k", "200K"), ("1m", "1M")):
         emit(f"{mark(cfg['context_window']==opt)}{lbl}", sub=1, action=SELF,
              args=["--set", f"context_window={opt}"], refresh=True)
+
+    emit("Check for updates")
+    for opt, lbl in (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")):
+        emit(f"{mark(cfg['update_check']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"update_check={opt}"], refresh=True)
 
     # Live-usage status: on when the statusLine bridge has written real data.
     if load_usage():

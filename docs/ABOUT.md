@@ -165,9 +165,11 @@ burnbar is meant to live in the background forever, so resource use mattered.
 
 ## Privacy
 
-Everything stays on the machine. burnbar makes no network calls. It never
-touches your auth token — Claude Code already holds that; the bridge only ever
-reads the JSON Claude Code hands it and writes a local file.
+Your usage stays on the machine. The only network call burnbar ever makes is an
+optional once-a-day version check — a plain GET to GitHub that sends nothing
+about you and can be switched off in Settings (after which it makes none at all).
+It never touches your auth token — Claude Code already holds that; the bridge
+only ever reads the JSON Claude Code hands it and writes a local file.
 
 ---
 
