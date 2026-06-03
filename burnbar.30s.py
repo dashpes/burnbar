@@ -61,9 +61,9 @@ MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 #   muted = section headers + secondary notes
 THEMES = {
     "default":   {"grad": ("#30d158", "#ffd60a", "#ff9f0a", "#ff453a"),
-                  "text": "#1d1d1f,#f5f5f7", "muted": "#8e8e93"},
+                  "text": "#1d1d1f,#f5f5f7", "muted": "#56565b,#9a9aa0"},
     "mono":      {"grad": ("#8e8e93", "#aeaeb2", "#d1d1d6", "#f5f5f7"),
-                  "text": "#1d1d1f,#f5f5f7", "muted": "#8e8e93"},
+                  "text": "#1d1d1f,#f5f5f7", "muted": "#56565b,#9a9aa0"},
     "nord":      {"grad": ("#a3be8c", "#ebcb8b", "#d08770", "#bf616a"),
                   "text": "#2e3440,#d8dee9", "muted": "#5e81ac,#81a1c1"},
     "dracula":   {"grad": ("#50fa7b", "#f1fa8c", "#ffb86c", "#ff5555"),
@@ -482,15 +482,22 @@ def emit_live_limits(usage, now_epoch, tz):
     sep()
 
 
+def _darken(c, f=0.55):
+    c = c.lstrip("#")
+    r, g, b = (int(c[i:i + 2], 16) for i in (0, 2, 4))
+    return f"#{int(r * f):02x}{int(g * f):02x}{int(b * f):02x}"
+
+
+def adaptive(c):
+    """Make a single hex readable in both menus: darker in light mode (where
+    saturated colors wash out), original/vibrant in dark mode. Pairs pass through."""
+    return c if "," in c else f"{_darken(c)},{c}"
+
+
 def color_for(pct):
     g = TH["grad"]
-    if pct >= 90:
-        return g[3]
-    if pct >= 70:
-        return g[2]
-    if pct >= 40:
-        return g[1]
-    return g[0]
+    c = g[3] if pct >= 90 else g[2] if pct >= 70 else g[1] if pct >= 40 else g[0]
+    return adaptive(c)
 
 
 # ─────────────────────────── main ───────────────────────────
@@ -689,7 +696,7 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
         s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
         live = " (live)" if (b is blocks[-1] and active is not None) else ""
         emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
-             sub=1, color=TH["grad"][0] if live else None)
+             sub=1, color=adaptive(TH["grad"][0]) if live else None)
     sep()
 
 
