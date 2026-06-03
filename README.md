@@ -25,10 +25,12 @@ Click it for a **Stats-style dropdown** with SF Symbol section headers:
 
 - **Usage limits (live)** — 5-hour / 7-day / Opus, each a fill bar with exact
   `used_percentage` and time-to-reset, straight from Anthropic (cross-surface)
-- **Context (live agents)** — how full each running session's context window is,
-  so you can see at a glance how much room you have left; each row is labelled
-  with Claude's own session title (the one in the resume picker), with subagents
-  listed under the session that spawned them
+- **Context (live agents)** — how full each *open* session's context window is, so
+  at a glance you can tell which session still has room and which is about to
+  auto-compact. burnbar shows the sessions that are genuinely running (it matches
+  live `claude` processes to their working dir, so a window you closed drops off
+  right away), labels each with Claude's own session title (the one in the resume
+  picker), and nests any subagents under the session that spawned them
 - **Today** — total tokens, messages, sessions, peak hour, hourly sparkline, by model
 - **Last 7 days** — per-day mini bars, week + month totals
 - **All time** — totals, raw vs effective tokens, sessions, projects, daily
@@ -160,13 +162,17 @@ bridge is wired, the menu bar shows `set up` and points you here.
   followed by a reset countdown (swap to a token count or nothing in Settings).
 - **Context (live agents)** reads the same transcripts: a session's current
   context-window fill is its latest turn's prompt size (`input` +
-  `cache_creation` + `cache_read` — what the model was actually sent). Main
-  sessions touched in the last couple of hours are shown, with the subagents
-  still running underneath them (linked by the `sessionId` in each
-  `agent-*.jsonl`). Rows are labelled with Claude's auto-generated session title
-  (the `aiTitle` it writes to the transcript and shows in the resume picker),
-  falling back to the project folder and git branch. The bar reddens as the
-  window fills, so a session about to compact stands out.
+  `cache_creation` + `cache_read` — what the model was actually sent). To show
+  only sessions that are *actually open*, burnbar matches each running `claude`
+  process to its working directory (`pgrep` + `lsof`) instead of guessing from
+  recency — so a window you just closed disappears immediately, and two terminals
+  in the same repo are counted separately; if it can't read processes it falls
+  back to a recent-activity window. Subagents still running are nested under the
+  session that spawned them (linked by the `sessionId` in each `agent-*.jsonl`)
+  and drop off the moment they finish. Rows are labelled with Claude's
+  auto-generated session title (the `aiTitle` it writes to the transcript and
+  shows in the resume picker), falling back to the project folder and git branch.
+  The bar reddens as the window fills, so a session about to compact stands out.
 
 Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
 by the model running the latest turn: Opus is the 1M-context model, so an Opus
