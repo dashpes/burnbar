@@ -52,7 +52,7 @@ headers:
   an hourly-activity sparkline, breakdowns by model, by project, and your top
   sessions.
 - **Records** — your busiest 5-hour block and busiest day ever.
-- **Settings** — change the theme, switch between a full and a compact layout,
+- **Settings** — change the theme, switch between the compact and detailed layouts,
   and tweak the menu-bar bar, all by clicking; no config files to edit.
 
 ---
@@ -157,8 +157,9 @@ burnbar is meant to live in the background forever, so resource use mattered.
 - **Settings without a settings window.** Every option is a clickable menu item
   that re-invokes the script to write a small JSON config and refresh — so you
   get a real settings experience with zero native UI code.
-- **Compact vs full.** A one-click toggle between the full stats panel and a
-  compact view that's just the live limits, today, and a "More stats" submenu.
+- **Compact vs detailed.** A one-click toggle between the default compact view —
+  just the live limits, today, and a "More stats" submenu — and the full
+  detailed stats panel.
 
 ---
 

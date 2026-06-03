@@ -13,16 +13,20 @@ rich token stats from your own local transcripts. No `ccusage`, no API keys, no
 network calls, no pricing tables — nothing leaves your machine.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="burnbar default view" width="370">
-  &nbsp;&nbsp;
   <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
+  &nbsp;&nbsp;
+  <img src="docs/screenshot.png" alt="burnbar detailed view" width="370">
 </p>
-<p align="center"><em>Default view (left) and Compact view (right).</em></p>
+<p align="center"><em>Compact view (left, the default) and Detailed view (right).</em></p>
 
 Click it for a **Stats-style dropdown** with SF Symbol section headers:
 
 - **Usage limits (live)** — 5-hour / 7-day / Opus, each a fill bar with exact
   `used_percentage` and time-to-reset, straight from Anthropic (cross-surface)
+- **Context (live agents)** — how full each running session's context window is,
+  so you can see at a glance how much room you have left; each row is labelled
+  with Claude's own session title (the one in the resume picker), with subagents
+  listed under the session that spawned them
 - **Today** — total tokens, messages, sessions, peak hour, hourly sparkline, by model
 - **Last 7 days** — per-day mini bars, week + month totals
 - **All time** — totals, raw vs effective tokens, sessions, projects, daily
@@ -83,13 +87,15 @@ The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 Click the menu bar item → **Settings** to change things live; selections are
 marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 
-- **View** — `Default` (full panel) or `Compact` (just Today + a *More stats*
-  submenu)
+- **View** — `Compact` (default: just Today + a *More stats* submenu) or
+  `Detailed` (the full stats panel)
 - **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
   (recolors the bar + accent text)
 - **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
   `· 3h40m`), `Token count`, or `None`
 - **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
+- **Context window** — how the *Context* section sizes each bar: `Auto-detect`,
+  `200K`, or `1M` (see below)
 
 ## How the live limits work
 
@@ -130,6 +136,21 @@ bridge is wired, the menu bar shows `set up` and points you here.
   into rolling 5-hour blocks and rolled up by day / model / project / session.
 - The menu bar fill bar is colored green → yellow → orange → red as it climbs,
   followed by a reset countdown (swap to a token count or nothing in Settings).
+- **Context (live agents)** reads the same transcripts: a session's current
+  context-window fill is its latest turn's prompt size (`input` +
+  `cache_creation` + `cache_read` — what the model was actually sent). Main
+  sessions touched in the last couple of hours are shown, with the subagents
+  still running underneath them (linked by the `sessionId` in each
+  `agent-*.jsonl`). Rows are labelled with Claude's auto-generated session title
+  (the `aiTitle` it writes to the transcript and shows in the resume picker),
+  falling back to the project folder and git branch. The bar reddens as the
+  window fills, so a session about to compact stands out.
+
+Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
+by the model running the latest turn: Opus is the 1M-context model, so an Opus
+session is sized to 1M; Haiku/Sonnet sessions use the standard 200K (with a
+fallback to 1M for anything that's somehow crossed 200K). If you run a fixed
+setup, pin it to `200K` or `1M` in Settings.
 
 Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the token
 stats, since they're far lighter than fresh tokens — this makes "effective
@@ -160,6 +181,8 @@ top of `burnbar.30s.py`:
 | `BAR_CELLS`         | `10`      | Bar width inside the dropdown                |
 | `CACHE_READ_WEIGHT` | `0.1`     | Weight applied to cache-read tokens          |
 | `RECENT_DAYS`       | `3`       | Recent window re-parsed each refresh (lean)  |
+| `CONTEXT_ACTIVE_MIN`| `120`     | Minutes a main session stays in *Context*    |
+| `CONTEXT_AGENT_MIN` | `15`      | Minutes a subagent stays in *Context*        |
 | `THEMES`            | —         | Add your own `name: {grad, text, muted}`     |
 
 ## License

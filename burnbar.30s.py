@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.3.0</bitbar.version>
+# <bitbar.version>0.5.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -12,7 +12,7 @@
 burnbar — a SwiftBar/xbar plugin.
 
 Menu bar:  a live progress bar for your current Claude Code 5-hour usage block.
-Dropdown:  a Stats-style panel (compact or full), with an in-menu Settings
+Dropdown:  a Stats-style panel (compact by default, or detailed), with Settings
            submenu for theme / view / bar width — no JSON editing required.
 
 All from Claude Code's own local transcripts (~/.claude/projects/**/*.jsonl).
@@ -35,25 +35,36 @@ PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
 CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
-CACHE_VERSION = 1
+CACHE_VERSION = 4                # bumped: per-file aggregates now carry context info
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
 #                                  = less CPU/RAM per refresh, shorter recent history.
 CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight burn
+
+# ── context window (how much of the model's window each agent has filled) ──
+CTX_200K = 200_000               # standard Claude Code window
+CTX_1M = 1_000_000               # the 1M-context Opus
+CONTEXT_ACTIVE_MIN = 120         # a main session counts as "active" if touched this recently
+CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still running
+CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
+CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
+CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
 MONO = "Menlo"
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
 
 # ── user-configurable defaults (overridden by config.json) ──
 DEFAULTS = {
-    "view": "default",           # "default" | "compact"
+    "view": "compact",           # "compact" | "detailed"
     "theme": "default",          # see THEMES
     "menubar_cells": 5,          # bar width in the menu bar
     "title_size": 11,            # menu-bar font size
     "menubar_extra": "countdown",  # trailer after the %: countdown | tokens | none
+    "context_window": "auto",    # how to size the context bar: auto | 200k | 1m
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
+CONTEXT_WINDOWS = ("auto", "200k", "1m")
 
 # ── themes: a full palette, so the whole dropdown gets tinted ──
 #   grad  = (low, mid, high, max) bar gradient + alert accents (by % burn)
@@ -89,10 +100,14 @@ def load_config():
         pass
     if cfg.get("theme") not in THEMES:
         cfg["theme"] = "default"
-    if cfg.get("view") not in ("default", "compact"):
-        cfg["view"] = "default"
+    if cfg.get("view") in ("default", "expanded"):   # legacy names for the full view
+        cfg["view"] = "detailed"
+    if cfg.get("view") not in ("compact", "detailed"):
+        cfg["view"] = "compact"
     if cfg.get("menubar_extra") not in MENUBAR_EXTRAS:
         cfg["menubar_extra"] = "countdown"
+    if cfg.get("context_window") not in CONTEXT_WINDOWS:
+        cfg["context_window"] = "auto"
     return cfg
 
 
@@ -152,6 +167,44 @@ def fmt_dur(delta):
     return f"{h}h{m:02d}m"
 
 
+def fmt_age(secs):
+    """Compact 'time since' for the context section: 4m, 1h, 2h30m."""
+    m = max(0, int(secs // 60))
+    if m < 60:
+        return f"{m}m"
+    h, rm = m // 60, m % 60
+    return f"{h}h{rm:02d}m" if rm else f"{h}h"
+
+
+def context_window(model, peak_ctx, mode):
+    """Pick a session's context-window size. 'auto' goes by the model running the
+    latest turn — Opus is the 1M-context model, everything else is the standard
+    200K — and falls back to the high-water mark for any non-Opus session that has
+    somehow crossed 200K (e.g. a 1M-beta Sonnet)."""
+    if mode == "200k":
+        return CTX_200K
+    if mode == "1m":
+        return CTX_1M
+    if "opus" in (model or "").lower():
+        return CTX_1M
+    return CTX_1M if peak_ctx > CTX_200K else CTX_200K
+
+
+def ctx_label(win):
+    return "1M" if win >= CTX_1M else f"{win // 1000}K"
+
+
+def ellipsis(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def model_short(m):
+    """'claude-opus-4-8' -> 'opus', 'claude-haiku-4-5-20251001' -> 'haiku'."""
+    m = (m or "").replace("claude-", "")
+    return m.split("-")[0] if m else "?"
+
+
 def new_tokens():
     return {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
 
@@ -184,6 +237,14 @@ def weighted_one(u):
 
 def raw_total(t):
     return t["input"] + t["output"] + t["cache_creation"] + t["cache_read"]
+
+
+def ctx_one(u):
+    """A turn's context-window occupancy: the full prompt it was sent (all input
+    + cache, no output). The latest turn's value is the session's current fill."""
+    return ((u.get("input_tokens", 0) or 0)
+            + (u.get("cache_creation_input_tokens", 0) or 0)
+            + (u.get("cache_read_input_tokens", 0) or 0))
 
 
 def load_cache():
@@ -281,6 +342,10 @@ def parse_file(fp, project, session, tz):
     all_t, msgs = new_tokens(), 0
     by_model, by_day, by_hour = {}, {}, [0.0] * 24
     sess_last = None
+    last_ctx, peak_ctx = 0, 0       # current + high-water context-window fill
+    last_model = "?"                # model of the latest turn (sizes the window)
+    title = None                    # Claude's auto-generated session title (aiTitle)
+    meta = {}                       # cwd / parent session id / agent id (stable per file)
     records = []
     seen = set()
     try:
@@ -295,6 +360,20 @@ def parse_file(fp, project, session, tz):
             try:
                 o = json.loads(line)
             except Exception:
+                continue
+            if not meta and o.get("sessionId"):
+                # First line carries the session header: cwd (true project), the
+                # parent sessionId (== own id for a main session, parent's for a
+                # subagent), agentId, the sidechain flag that marks subagents, and
+                # the git branch (a cheap differentiator between sibling sessions).
+                meta = {"cwd": o.get("cwd"), "sid": o.get("sessionId"),
+                        "agent_id": o.get("agentId"),
+                        "sidechain": bool(o.get("isSidechain")),
+                        "branch": o.get("gitBranch")}
+            if o.get("type") == "ai-title":
+                # Claude names each session (the title shown in the resume picker);
+                # it's revised over the session, so keep the most recent one.
+                title = o.get("aiTitle") or title
                 continue
             if o.get("type") != "assistant":
                 continue
@@ -314,8 +393,13 @@ def parse_file(fp, project, session, tz):
             model = msg.get("model", "?")
             add_tokens(all_t, u); msgs += 1
             add_tokens(by_model.setdefault(model, new_tokens()), u)
+            c = ctx_one(u)
+            if c > peak_ctx:
+                peak_ctx = c
             if sess_last is None or ts > sess_last:
                 sess_last = ts
+                last_ctx = c        # context fill as of the most recent turn
+                last_model = model
             lts = tsd.astimezone(tz)
             d, hr = lts.date().isoformat(), lts.hour
             wt = weighted_one(u)
@@ -325,7 +409,8 @@ def parse_file(fp, project, session, tz):
                             "project": project, "session": session})
     agg = {"all": all_t, "msgs": msgs, "by_model": by_model, "by_day": by_day,
            "by_hour": by_hour, "project": project, "session": session,
-           "sess_last": sess_last}
+           "sess_last": sess_last, "last_ctx": last_ctx, "peak_ctx": peak_ctx,
+           "last_model": last_model, "title": title, "meta": meta}
     return agg, records
 
 
@@ -382,8 +467,16 @@ def gather(now, tz):
                                      {"t": new_tokens(), "m": 0, "s": set()})
         merge(proj["t"], agg["all"]); proj["m"] += agg["msgs"]
         proj["s"].add(agg["session"])
-        by_session[agg["session"]] = {"t": agg["all"], "m": agg["msgs"],
-                                      "p": agg["project"], "last": agg["sess_last"]}
+        meta = agg.get("meta") or {}
+        by_session[agg["session"]] = {
+            "t": agg["all"], "m": agg["msgs"], "p": agg["project"],
+            "last": agg["sess_last"], "mtime": mtime,
+            "last_ctx": agg.get("last_ctx", 0), "peak_ctx": agg.get("peak_ctx", 0),
+            "model": agg.get("last_model", "?"),
+            "title": agg.get("title"), "branch": meta.get("branch"),
+            "sid": meta.get("sid") or agg["session"], "cwd": meta.get("cwd"),
+            "agent": bool(meta.get("sidechain")) or agg["session"].startswith("agent-"),
+            "agent_id": meta.get("agent_id")}
 
     # All-time peak block: high-water in cache, refreshed from whatever we parsed.
     peak = cache.get("peak")
@@ -501,6 +594,80 @@ def color_for(pct):
     return g[3] if pct >= 90 else g[2] if pct >= 70 else g[1] if pct >= 40 else g[0]
 
 
+# ─────────────────────── context (live agents) ───────────────────────
+def ctx_session_label(sv):
+    """Which session this is. Prefer Claude's own session title (the one in the
+    resume picker); fall back to the project folder, adding the git branch when
+    it's a meaningful differentiator between sibling sessions."""
+    if sv.get("title"):
+        return sv["title"]
+    cwd = sv.get("cwd")
+    proj = (os.path.basename(cwd.rstrip("/")) if cwd else sv.get("p")) or "?"
+    br = sv.get("branch")
+    return f"{proj} · {br}" if br and br not in ("main", "master", "HEAD") else proj
+
+
+def ctx_row(sv, now_ts, mode, agent=False):
+    """One agent's context-window fill. The bar/numbers lead in fixed columns so
+    rows line up; the (variable-length) session title trails."""
+    win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
+    used = sv.get("last_ctx", 0)
+    frac = used / win if win else 0.0
+    pct = min(100, max(0, round(frac * 100)))
+    age = now_ts - sv.get("mtime", 0)
+    when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
+    if agent:
+        aid = (sv.get("agent_id") or "")[:4]
+        label = f"↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
+    else:
+        label = ctx_session_label(sv)
+    uw = f"{compact(used)}/{ctx_label(win)}"
+    emit(f"{render_bar(frac, 6)} {pct:>3}% {uw:<9}{when:>6}  {ellipsis(label, 32)}",
+         color=adaptive(color_for(pct)))
+
+
+def emit_context(by_session, now, cfg):
+    """Per-agent context-window usage, so you can see at a glance how much room is
+    left in each running session. 'Agents' = recently-active main sessions plus the
+    subagents they spawned (linked by sessionId), sorted by recency."""
+    mode = cfg["context_window"]
+    now_ts = now.timestamp()
+    main_cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+    agent_cut = now_ts - CONTEXT_AGENT_MIN * 60
+    mains = sorted(((k, v) for k, v in by_session.items()
+                    if not v.get("agent") and v.get("last_ctx", 0) > 0
+                    and v.get("mtime", 0) >= main_cut),
+                   key=lambda kv: -kv[1]["mtime"])
+    agents = sorted(((k, v) for k, v in by_session.items()
+                     if v.get("agent") and v.get("last_ctx", 0) > 0
+                     and v.get("mtime", 0) >= agent_cut),
+                    key=lambda kv: -kv[1]["mtime"])
+    if not mains and not agents:
+        return
+    by_parent = {}
+    for k, v in agents:
+        by_parent.setdefault(v.get("sid"), []).append((k, v))
+
+    emit("CONTEXT · live agents", color=MUTED, sfimage="gauge", header=True)
+
+    def emit_agents(kids):
+        for ak, av in kids[:CONTEXT_MAX_AGENTS]:
+            ctx_row(av, now_ts, mode, agent=True)
+            shown_agents.add(ak)
+        if len(kids) > CONTEXT_MAX_AGENTS:
+            emit(f"{'':>29}↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED)
+
+    shown_agents = set()
+    for key, sv in mains[:CONTEXT_MAX_ROWS]:
+        ctx_row(sv, now_ts, mode)
+        emit_agents(by_parent.get(key, []))
+    # Subagents still running while their parent has gone idle (or fell past the cap).
+    orphans = [(k, v) for k, v in agents if k not in shown_agents]
+    if orphans:
+        emit_agents(orphans)
+    sep()
+
+
 # ─────────────────────────── main ───────────────────────────
 def main():
     global TH, MUTED, PLAN
@@ -593,6 +760,9 @@ def main():
         emit("Run install.sh to show real 5h / 7d limits", sub=1,
              open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
         sep()
+
+    # ════════════════ CONTEXT (live agents) ════════════════
+    emit_context(by_session, now, cfg)
 
     # ════════════════ TODAY ════════════════
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
@@ -709,10 +879,10 @@ def settings_menu(cfg):
         return "[x] " if active else "[ ] "
 
     emit("View")
-    emit(f"{mark(cfg['view']=='default')}Default", sub=1, action=SELF,
-         args=["--set", "view=default"], refresh=True)
     emit(f"{mark(cfg['view']=='compact')}Compact", sub=1, action=SELF,
          args=["--set", "view=compact"], refresh=True)
+    emit(f"{mark(cfg['view']=='detailed')}Detailed", sub=1, action=SELF,
+         args=["--set", "view=detailed"], refresh=True)
 
     emit("Theme")
     for name in THEMES:
@@ -729,6 +899,11 @@ def settings_menu(cfg):
     for w in (3, 5, 8, 10):
         emit(f"{mark(cfg['menubar_cells']==w)}{w}", sub=1, action=SELF,
              args=["--set", f"menubar_cells={w}"], refresh=True)
+
+    emit("Context window")
+    for opt, lbl in (("auto", "Auto-detect"), ("200k", "200K"), ("1m", "1M")):
+        emit(f"{mark(cfg['context_window']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"context_window={opt}"], refresh=True)
 
     # Live-usage status: on when the statusLine bridge has written real data.
     if load_usage():
