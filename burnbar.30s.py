@@ -38,6 +38,9 @@ MONO = "Menlo"
 FONT = f"font={MONO} size=13"
 HEADER_FONT = f"font={MONO} size=12"
 TITLE_FONT = f"font={MONO} size={TITLE_SIZE}"
+# Adaptive high-contrast text (light,dark) so info rows aren't greyed out.
+PRIMARY = "#1d1d1f,#f5f5f7"
+MUTED = "#8e8e93"                 # section headers / secondary notes
 
 # ─────────────────────────── helpers ───────────────────────────
 def parse_ts(s):
@@ -121,8 +124,9 @@ def emit(text, sub=0, color=None, sfimage=None, refresh=False,
          bash=None, param1=None, header=False):
     prefix = "--" * sub
     params = [HEADER_FONT if header else FONT]
-    if color:
-        params.append(f"color={color}")
+    if color is None:
+        color = PRIMARY          # force readable contrast on plain info rows
+    params.append(f"color={color}")
     if sfimage:
         params.append(f"sfimage={sfimage}")
     if refresh:
