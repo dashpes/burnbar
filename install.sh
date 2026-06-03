@@ -48,22 +48,26 @@ BRIDGE="$HERE/burnbar-statusline.py"
 chmod +x "$BRIDGE"
 read -r -p "Enable live usage (real limits + reset times via Claude Code statusLine)? [Y/n] " yn
 if [[ ! "$yn" =~ ^[Nn]$ ]]; then
-  python3 - "$BRIDGE" <<'PY'
+  mkdir -p "$HOME/.claude"
+  SETTINGS="$HOME/.claude/settings.json"
+  [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.burnbar.bak" && echo "  Backed up -> $SETTINGS.burnbar.bak"
+  FORCE="${FORCE:-0}" python3 - "$BRIDGE" "$SETTINGS" <<'PY'
 import json, os, sys
-bridge = sys.argv[1]
-p = os.path.expanduser("~/.claude/settings.json")
+bridge, p = sys.argv[1], sys.argv[2]
 try:
     d = json.load(open(p))
 except Exception:
     d = {}
 ex = d.get("statusLine")
-if isinstance(ex, dict) and ex.get("command") and ex.get("command") != bridge:
-    print("  NOTE: you already have a statusLine configured — not overwriting it.")
-    print("        To still capture live usage, have that command also append the")
-    print("        rate_limits from its stdin to ~/.config/burnbar/usage.json (see README).")
+clash = isinstance(ex, dict) and ex.get("command") and ex.get("command") != bridge
+if clash and os.environ.get("FORCE") != "1":
+    print("  NOTE: you already have a statusLine configured — leaving it as-is.")
+    print("        Re-run with  FORCE=1 ./install.sh  to replace it, or have your")
+    print("        command also write rate_limits to ~/.config/burnbar/usage.json (see README).")
 else:
     d["statusLine"] = {"type": "command", "command": bridge, "padding": 0}
-    json.dump(d, open(p, "w"), indent=2)
+    with open(p, "w") as f:
+        json.dump(d, f, indent=2)
     print("  Live usage enabled. It populates on your next Claude Code message.")
 PY
 fi
