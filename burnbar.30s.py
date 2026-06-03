@@ -50,18 +50,28 @@ DEFAULTS = {
     "show_menubar_tokens": False,
 }
 
-# ── themes: (low, mid, high, max) gradient for the bar + alert accents ──
+# ── themes: a full palette, so the whole dropdown gets tinted ──
+#   grad  = (low, mid, high, max) bar gradient + alert accents (by % burn)
+#   text  = body rows, adaptive "light,dark" so it stays readable in both menus
+#   muted = section headers + secondary notes
 THEMES = {
-    "default":   ("#30d158", "#ffd60a", "#ff9f0a", "#ff453a"),
-    "mono":      ("#8e8e93", "#aeaeb2", "#d1d1d6", "#f5f5f7"),
-    "nord":      ("#a3be8c", "#ebcb8b", "#d08770", "#bf616a"),
-    "dracula":   ("#50fa7b", "#f1fa8c", "#ffb86c", "#ff5555"),
-    "solarized": ("#859900", "#b58900", "#cb4b16", "#dc322f"),
-    "matrix":    ("#39ff14", "#32e60f", "#28b80c", "#1f8f08"),
+    "default":   {"grad": ("#30d158", "#ffd60a", "#ff9f0a", "#ff453a"),
+                  "text": "#1d1d1f,#f5f5f7", "muted": "#8e8e93"},
+    "mono":      {"grad": ("#8e8e93", "#aeaeb2", "#d1d1d6", "#f5f5f7"),
+                  "text": "#1d1d1f,#f5f5f7", "muted": "#8e8e93"},
+    "nord":      {"grad": ("#a3be8c", "#ebcb8b", "#d08770", "#bf616a"),
+                  "text": "#2e3440,#d8dee9", "muted": "#5e81ac,#81a1c1"},
+    "dracula":   {"grad": ("#50fa7b", "#f1fa8c", "#ffb86c", "#ff5555"),
+                  "text": "#44475a,#f8f8f2", "muted": "#6272a4,#9aa6d4"},
+    "solarized": {"grad": ("#859900", "#b58900", "#cb4b16", "#dc322f"),
+                  "text": "#073642,#93a1a1", "muted": "#268bd2,#6c9fc2"},
+    "matrix":    {"grad": ("#39ff14", "#32e60f", "#28b80c", "#1f8f08"),
+                  "text": "#0a5f0a,#39ff14", "muted": "#1f8f08,#2fd80c"},
 }
 
-# Module-level theme; set in main() once config is loaded.
+# Module-level theme/derived colors; set in main() once config is loaded.
 TH = THEMES["default"]
+MUTED = TH["muted"]
 
 
 # ─────────────────────────── config i/o ───────────────────────────
@@ -196,7 +206,7 @@ def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
          action=None, args=None, open_path=None, header=False):
     prefix = "--" * sub
     params = [f"font={MONO} size={12 if header else size}"]
-    params.append(f"color={color if color is not None else PRIMARY}")
+    params.append(f"color={color if color is not None else TH['text']}")
     if sfimage:
         params.append(f"sfimage={sfimage}")
     if refresh:
@@ -302,20 +312,22 @@ def spark(values):
 
 
 def color_for(pct):
+    g = TH["grad"]
     if pct >= 90:
-        return TH[3]
+        return g[3]
     if pct >= 70:
-        return TH[2]
+        return g[2]
     if pct >= 40:
-        return TH[1]
-    return TH[0]
+        return g[1]
+    return g[0]
 
 
 # ─────────────────────────── main ───────────────────────────
 def main():
-    global TH
+    global TH, MUTED
     cfg = load_config()
     TH = THEMES[cfg["theme"]]
+    MUTED = TH["muted"]
     cells = cfg["menubar_cells"]
     title_size = cfg["title_size"]
     compact_view = cfg["view"] == "compact"
@@ -419,11 +431,12 @@ def main():
         e_l = end.astimezone(tz).strftime("%H:%M")
         if compact_view:
             emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  "
-                 f"{pct}% · {compact(burn)} tok")
+                 f"{pct}% · {compact(burn)} tok", color=color_for(pct))
             emit(f"Resets {fmt_dur(end - now)} · {compact(rate)}/min",
                  color=color_for(pct))
         else:
-            emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  {pct}% of peak")
+            emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  {pct}% of peak",
+                 color=color_for(pct))
             emit(f"Burn        {compact(burn):>8} tok")
             emit(f"Messages    {active['msgs']:>8}")
             emit(f"Window      {s_l}–{e_l}")
@@ -542,7 +555,7 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
         s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
         live = " ● live" if (b is blocks[-1] and active is not None) else ""
         emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
-             sub=1, color=TH[0] if live else None)
+             sub=1, color=TH["grad"][0] if live else None)
     sep()
 
 
