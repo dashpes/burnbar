@@ -198,9 +198,9 @@ def context_window(model, peak_ctx, mode):
         return CTX_200K
     if mode == "1m":
         return CTX_1M
-    if "opus" in (model or "").lower():
+    if "opus" in (model or "").lower() or peak_ctx > CTX_200K:
         return CTX_1M
-    return CTX_1M if peak_ctx > CTX_200K else CTX_200K
+    return CTX_200K
 
 
 def ctx_label(win):
@@ -730,18 +730,21 @@ def live_session_cwds():
                               capture_output=True, text=True, timeout=2).stdout.split()
     except Exception:
         return None
+    if not pids:
+        return {}
+    try:
+        # One lsof for all pids (it's the slow call): each process emits its cwd
+        # as an `n` line, so counting those tallies live sessions per dir.
+        out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn",
+                              "-p", ",".join(pids)],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return None
     counts = {}
-    for pid in pids:
-        try:
-            out = subprocess.run(["/usr/sbin/lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
-                                 capture_output=True, text=True, timeout=2).stdout
-        except Exception:
-            continue
-        for line in out.splitlines():
-            if line.startswith("n"):
-                cwd = os.path.normpath(line[1:])
-                counts[cwd] = counts.get(cwd, 0) + 1
-                break
+    for line in out.splitlines():
+        if line.startswith("n"):
+            cwd = os.path.normpath(line[1:])
+            counts[cwd] = counts.get(cwd, 0) + 1
     return counts
 
 
@@ -751,18 +754,40 @@ def emit_context(by_session, now, cfg):
     `claude` process) plus the subagents they're currently running."""
     mode = cfg["context_window"]
     now_ts = now.timestamp()
-    proc = live_session_cwds()
 
     def norm(sv):
         return os.path.normpath(sv.get("cwd") or "")
+
+    def agent_running(av):
+        # A subagent's parent session blocks while the subagent runs; once the
+        # parent writes again (the tool result) the subagent has finished — so it's
+        # live only until its parent's transcript passes it. Age is a backstop in
+        # case the parent was killed mid-run and never resumes.
+        if now_ts - av.get("mtime", 0) > CONTEXT_AGENT_MIN * 60:
+            return False
+        parent = by_session.get(av.get("sid"))
+        if parent and not parent.get("agent"):
+            return av.get("mtime", 0) >= parent.get("mtime", 0)
+        return True
+
+    # Cheap in-memory candidates first, so we only shell out to find live
+    # processes when there's actually something that could be shown.
+    cand = sorted((kv for kv in by_session.items()
+                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
+                  key=lambda kv: -kv[1]["mtime"])
+    agent_cand = sorted(((k, v) for k, v in by_session.items()
+                         if v.get("agent") and v.get("last_ctx", 0) > 0
+                         and agent_running(v)),
+                        key=lambda kv: -kv[1]["mtime"])
+    if not cand and not agent_cand:
+        return
+
+    proc = live_session_cwds()
 
     # Main sessions: prefer the precise process signal — for each working dir show
     # the N most-recently-active sessions where N = live `claude` processes there,
     # so closed sessions can't linger. If we can't read processes, fall back to a
     # recency window.
-    cand = sorted((kv for kv in by_session.items()
-                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
-                  key=lambda kv: -kv[1]["mtime"])
     if proc is None:
         cut = now_ts - CONTEXT_ACTIVE_MIN * 60
         mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
@@ -775,13 +800,8 @@ def emit_context(by_session, now, cfg):
                 mains.append((k, v))
                 budget[c] -= 1
 
-    # Subagents: only ones still running (tight window), in a live working dir.
-    agent_cut = now_ts - CONTEXT_AGENT_MIN * 60
-    agents = sorted(((k, v) for k, v in by_session.items()
-                     if v.get("agent") and v.get("last_ctx", 0) > 0
-                     and v.get("mtime", 0) >= agent_cut
-                     and (proc is None or norm(v) in proc)),
-                    key=lambda kv: -kv[1]["mtime"])
+    # Subagents: still-running ones (parent hasn't resumed) in a live working dir.
+    agents = [kv for kv in agent_cand if proc is None or norm(kv[1]) in proc]
     if not mains and not agents:
         return
     by_parent = {}
@@ -789,6 +809,8 @@ def emit_context(by_session, now, cfg):
         by_parent.setdefault(v.get("sid"), []).append((k, v))
 
     emit("CONTEXT · live agents", color=MUTED, sfimage="gauge", header=True)
+
+    shown_agents = set()
 
     def emit_agents(kids):
         for ak, av in kids[:CONTEXT_MAX_AGENTS]:
@@ -798,7 +820,6 @@ def emit_context(by_session, now, cfg):
             emit(f"  ↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
                  size=CONTEXT_TEXT_SIZE)
 
-    shown_agents = set()
     for key, sv in mains[:CONTEXT_MAX_ROWS]:
         ctx_row(sv, now_ts, mode)
         emit_agents(by_parent.get(key, []))
