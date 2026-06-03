@@ -40,7 +40,6 @@ CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file roll
 UPDATE_PATH = os.path.expanduser("~/.config/burnbar/update.json")  # daily update check
 CACHE_VERSION = 5                # bumped: per-file aggregates now carry context info
 
-VERSION = "0.6.0"                # keep in sync with the <bitbar.version> header above
 UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
 RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
     "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
@@ -63,6 +62,25 @@ CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer t
 MONO = "Menlo"
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
+
+
+def parse_version_header(text):
+    """Pull the version out of a plugin file's BitBar metadata header."""
+    m = re.search(r"<bitbar\.version>([^<]+)</bitbar\.version>", text or "")
+    return m.group(1).strip() if m else None
+
+
+def _read_self_version():
+    try:
+        with open(SELF, encoding="utf-8") as f:
+            return parse_version_header(f.read(2048))
+    except Exception:
+        return None
+
+
+# Single source of truth for the version: the <bitbar.version> header at the top of
+# this file. Bump it there alone — the daily update check and CI release both read it.
+VERSION = _read_self_version() or "0.0.0"
 
 # ── user-configurable defaults (overridden by config.json) ──
 DEFAULTS = {
@@ -319,8 +337,7 @@ def fetch_latest_version():
             head = r.read(2048).decode("utf-8", "replace")
     except Exception:
         return None
-    m = re.search(r"<bitbar\.version>([^<]+)</bitbar\.version>", head)
-    return m.group(1).strip() if m else None
+    return parse_version_header(head)
 
 
 def check_update(cfg, now_epoch):

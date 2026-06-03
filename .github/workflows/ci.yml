@@ -1,0 +1,47 @@
+name: ci
+
+# Validate every branch and PR: the scripts compile and the plugin runs clean.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Compile
+        run: python3 -m py_compile burnbar.30s.py burnbar-statusline.py
+
+      - name: Smoke run
+        # No ~/.claude transcripts here, so the plugin takes its "set up" path;
+        # we only assert it exits clean and prints a menu-bar line. Disable the
+        # update check so the smoke test stays hermetic (no network).
+        run: |
+          mkdir -p ~/.config/burnbar
+          echo '{"update_check":"off"}' > ~/.config/burnbar/config.json
+          out=$(python3 burnbar.30s.py)
+          echo "$out" | head -5
+          test -n "$out"
+
+      - name: Version bump reminder
+        # Non-blocking nudge: if the plugin changed in a PR but the version
+        # didn't, flag it — the release only fires when the version is new.
+        if: github.event_name == 'pull_request'
+        run: |
+          ver() { grep -oE '<bitbar\.version>[^<]+' "$1" | sed 's/.*>//'; }
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          base=$(git show "origin/${{ github.base_ref }}:burnbar.30s.py" | ver /dev/stdin || echo "")
+          head=$(ver burnbar.30s.py)
+          if git diff --quiet "origin/${{ github.base_ref }}" -- burnbar.30s.py; then
+            echo "burnbar.30s.py unchanged — no bump needed."
+          elif [ "$head" = "$base" ]; then
+            echo "::warning::burnbar.30s.py changed but version is still $head — bump <bitbar.version> if this is a release."
+          else
+            echo "Version $base -> $head."
+          fi
