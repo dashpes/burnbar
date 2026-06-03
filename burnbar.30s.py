@@ -466,7 +466,7 @@ def emit_live_limits(usage, now_epoch, tz):
             rs += f" ({datetime.fromtimestamp(reset, tz):%H:%M})"
         flag = " (!)" if d.get("status") in ("warning", "rejected", "exceeded") else ""
         emit(f"{label:<6}{render_bar(pc / 100, BAR_CELLS)} {pc}%{rs}{flag}",
-             color=color_for(pc))
+             color=adaptive(color_for(pc)))
 
     line("5-hr", rl.get("five_hour"))
     line("7-day", rl.get("seven_day"))
@@ -495,9 +495,10 @@ def adaptive(c):
 
 
 def color_for(pct):
+    # Raw vibrant color — right for the menu bar (dark background, light text).
+    # Dropdown rows wrap this in adaptive() since that panel is light in light mode.
     g = TH["grad"]
-    c = g[3] if pct >= 90 else g[2] if pct >= 70 else g[1] if pct >= 40 else g[0]
-    return adaptive(c)
+    return g[3] if pct >= 90 else g[2] if pct >= 70 else g[1] if pct >= 40 else g[0]
 
 
 # ─────────────────────────── main ───────────────────────────
