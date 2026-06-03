@@ -19,7 +19,7 @@ All from Claude Code's own local transcripts (~/.claude/projects/**/*.jsonl).
 No ccusage, no API keys, no network, no pricing.
 
 Settings are stored in ~/.config/burnbar/config.json and changed by clicking
-items in the ⚙ Settings submenu (which re-invoke this script with --set).
+items in the Settings submenu (which re-invoke this script with --set).
 """
 
 import glob
@@ -48,8 +48,9 @@ DEFAULTS = {
     "theme": "default",          # see THEMES
     "menubar_cells": 5,          # bar width in the menu bar
     "title_size": 11,            # menu-bar font size
-    "show_menubar_tokens": False,
+    "menubar_extra": "countdown",  # trailer after the %: countdown | tokens | none
 }
+MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 
 # ── themes: a full palette, so the whole dropdown gets tinted ──
 #   grad  = (low, mid, high, max) bar gradient + alert accents (by % burn)
@@ -87,6 +88,8 @@ def load_config():
         cfg["theme"] = "default"
     if cfg.get("view") not in ("default", "compact"):
         cfg["view"] = "default"
+    if cfg.get("menubar_extra") not in MENUBAR_EXTRAS:
+        cfg["menubar_extra"] = "countdown"
     return cfg
 
 
@@ -105,8 +108,6 @@ def coerce(key, value):
             return max(1, int(value))
         except ValueError:
             return DEFAULTS[key]
-    if key == "show_menubar_tokens":
-        return str(value).lower() in ("1", "true", "yes", "on")
     return value
 
 
@@ -358,7 +359,7 @@ def emit_live_limits(usage, now_epoch, tz):
         if reset:
             rs = f" · {fmt_dur(timedelta(seconds=reset - now_epoch))}"
             rs += f" ({datetime.fromtimestamp(reset, tz):%H:%M})"
-        flag = " ⚠" if d.get("status") in ("warning", "rejected", "exceeded") else ""
+        flag = " (!)" if d.get("status") in ("warning", "rejected", "exceeded") else ""
         emit(f"{label:<6}{render_bar(pc / 100, BAR_CELLS)} {pc}%{rs}{flag}",
              color=color_for(pc))
 
@@ -405,7 +406,6 @@ def main():
     window = timedelta(hours=BLOCK_HOURS)
 
     records = load_records()
-    state = load_state()
     usage = load_usage()
 
     if not records:
@@ -463,88 +463,40 @@ def main():
         if d >= week_start:
             week_w += wt
 
-    # ── active block + peak calibration ──
+    # ── derived (history only; live limits come from Anthropic) ──
     last = blocks[-1]
     active = last if now - last["start"] < window else None
-    all_w = [weighted(b["tokens"]) for b in blocks]
-    completed_w = [weighted(b["tokens"]) for b in blocks if b is not active]
-    if completed_w:
-        np = max(state.get("peak", 0), max(completed_w))
-        if np != state.get("peak", 0):
-            state["peak"] = np
-            save_state(state)
-    peak = max(all_w + [state.get("peak", 0), PEAK_FLOOR])
-
     peak_block = max(blocks, key=lambda b: weighted(b["tokens"]))
     busiest_day = max(by_day.items(), key=lambda kv: kv[1][0])
 
     # ════════════════ MENU BAR TITLE ════════════════
-    # Prefer the REAL 5-hour % from Anthropic (live, cross-surface) when present;
-    # otherwise fall back to the token-based estimate vs auto-calibrated peak.
-    burn_now = weighted(active["tokens"]) if active else 0
-    extra = f" · {compact(burn_now)}" if cfg["show_menubar_tokens"] else ""
+    # The REAL 5-hour % from Anthropic (live, cross-surface). The optional trailer
+    # is a countdown to reset (default), the token count, or nothing.
+    five = usage["rate_limits"]["five_hour"] if usage else None
+    reset_epoch = five.get("resets_at") if five else None
+    extra = ""
+    if cfg["menubar_extra"] == "countdown" and reset_epoch:
+        extra = f" · {fmt_dur(timedelta(seconds=reset_epoch - now_epoch))}"
+    elif cfg["menubar_extra"] == "tokens":
+        extra = f" · {compact(weighted(active['tokens']) if active else 0)}"
     if usage:
-        ap = min(100, max(0, round(usage["rate_limits"]["five_hour"].get("used_percentage") or 0)))
+        ap = min(100, max(0, round(five.get("used_percentage") or 0)))
         print(f"{render_bar(ap / 100, cells)} {ap}%{extra} | "
               f"font={MONO} size={title_size} color={color_for(ap)}")
-    elif active is None:
-        print(f"{render_bar(0, cells)} idle | "
-              f"font={MONO} size={title_size} color={MUTED}")
     else:
-        frac = min(1.0, burn_now / peak) if peak else 0
-        pct = min(100, round(frac * 100))
-        print(f"{render_bar(frac, cells)} {pct}%{extra} | "
-              f"font={MONO} size={title_size} color={color_for(pct)}")
+        print(f"{render_bar(0, cells)} set up | "
+              f"font={MONO} size={title_size} color={MUTED}")
     sep()
 
     # ════════════════ LIVE LIMITS (real, from Anthropic) ════════════════
     if usage:
         emit_live_limits(usage, now_epoch, tz)
-
-    # ════════════════ CURRENT BLOCK (token detail, this Mac) ════════════════
-    emit("5-HOUR TOKENS · this Mac" if usage else "CURRENT 5-HOUR BLOCK", color=MUTED,
-         sfimage="gauge.with.dots.needle.bottom.50percent", header=True)
-    if active is None:
-        emit(f"Idle · last activity {fmt_dur(now - last['last'])} ago", color=MUTED)
     else:
-        burn = weighted(active["tokens"])
-        pct = min(100, round(burn / peak * 100)) if peak else 0
-        end = active["start"] + window
-        elapsed_min = max(1.0, (now - active["start"]).total_seconds() / 60)
-        rate = burn / elapsed_min
-        projected = rate * BLOCK_HOURS * 60
-        s_l = active["start"].astimezone(tz).strftime("%H:%M")
-        e_l = end.astimezone(tz).strftime("%H:%M")
-        if compact_view:
-            if not usage:
-                emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  "
-                     f"{pct}% · {compact(burn)} tok", color=color_for(pct))
-                emit(f"Resets {fmt_dur(end - now)} · {compact(rate)}/min",
-                     color=color_for(pct))
-            else:
-                emit(f"{compact(burn)} tok · {compact(rate)}/min")
-        else:
-            if not usage:
-                emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  {pct}% of peak",
-                     color=color_for(pct))
-            emit(f"Burn        {compact(burn):>8} tok")
-            emit(f"Messages    {active['msgs']:>8}")
-            emit(f"Window      {s_l}–{e_l}")
-            if not usage:
-                emit(f"Resets in   {fmt_dur(end - now):>8}", color=color_for(pct))
-            emit(f"Rate        {compact(rate):>8} tok/min")
-            emit(f"Projected   {compact(projected):>8} tok @ block end",
-                 color=color_for(round(projected / peak * 100) if peak else 0))
-        emit("Breakdown")
-        for lbl, k in [("Input", "input"), ("Output", "output"),
-                       ("Cache write", "cache_creation"),
-                       ("Cache read", "cache_read")]:
-            emit(f"{lbl:<12}{compact(active['tokens'][k]):>8}", sub=1)
-        emit("By model")
-        for m, mt in sorted(active["by_model"].items(),
-                            key=lambda kv: -weighted(kv[1])):
-            emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
-    sep()
+        emit("USAGE LIMITS", color=MUTED, sfimage="bolt.fill", header=True)
+        emit("Live usage not set up", color=MUTED)
+        emit("Run install.sh to show real 5h / 7d limits", sub=1,
+             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
+        sep()
 
     # ════════════════ TODAY ════════════════
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
@@ -579,7 +531,7 @@ def main():
     else:
         emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
                            hour_profile, all_tok, all_msgs, records, today, tz,
-                           week_w, month_w, peak, peak_block, busiest_day, active, now)
+                           week_w, month_w, peak_block, busiest_day, active, now)
 
     settings_menu(cfg)
     sep()
@@ -590,7 +542,7 @@ def main():
 
 def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
                        hour_profile, all_tok, all_msgs, records, today, tz,
-                       week_w, month_w, peak, peak_block, busiest_day, active, now):
+                       week_w, month_w, peak_block, busiest_day, active, now):
     # LAST 7 DAYS
     emit("LAST 7 DAYS", color=MUTED, sfimage="chart.bar.fill", header=True)
     days = sorted(by_day.items(), reverse=True)[:7]
@@ -639,14 +591,13 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     bd, (bw, bm) = busiest_day
     emit(f"Busiest day {compact(bw):>8} tok")
     emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED)
-    emit(f"Calibrated  {compact(peak):>8} tok = 100%")
     sep()
 
     # RECENT BLOCKS
     emit("Recent blocks")
     for b in list(reversed(blocks))[:10]:
         s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
-        live = " ● live" if (b is blocks[-1] and active is not None) else ""
+        live = " (live)" if (b is blocks[-1] and active is not None) else ""
         emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
              sub=1, color=TH["grad"][0] if live else None)
     sep()
@@ -654,10 +605,10 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
 
 def settings_menu(cfg):
     sep()
-    emit("⚙ Settings", color=MUTED, sfimage="gearshape", header=True)
+    emit("Settings", color=MUTED, sfimage="gearshape", header=True)
 
     def mark(active):
-        return "● " if active else "○ "
+        return "[x] " if active else "[ ] "
 
     emit("View")
     emit(f"{mark(cfg['view']=='default')}Default", sub=1, action=SELF,
@@ -670,11 +621,11 @@ def settings_menu(cfg):
         emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1, action=SELF,
              args=["--set", f"theme={name}"], refresh=True)
 
-    emit("Menu-bar tokens")
-    emit(f"{mark(cfg['show_menubar_tokens'])}Show", sub=1, action=SELF,
-         args=["--set", "show_menubar_tokens=true"], refresh=True)
-    emit(f"{mark(not cfg['show_menubar_tokens'])}Hide", sub=1, action=SELF,
-         args=["--set", "show_menubar_tokens=false"], refresh=True)
+    emit("Menu-bar trailer")
+    for opt, lbl in (("countdown", "Reset countdown"), ("tokens", "Token count"),
+                     ("none", "None")):
+        emit(f"{mark(cfg['menubar_extra']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"menubar_extra={opt}"], refresh=True)
 
     emit("Menu-bar width")
     for w in (3, 5, 8, 10):
@@ -682,15 +633,14 @@ def settings_menu(cfg):
              args=["--set", f"menubar_cells={w}"], refresh=True)
 
     # Live-usage status: on when the statusLine bridge has written real data.
-    live = load_usage()
-    if live:
-        emit("Live usage  ● connected", color=MUTED)
+    if load_usage():
+        emit("Live usage  connected", color=MUTED)
     else:
-        emit("Live usage  ○ not set up", color=MUTED)
-        emit("Set up live limits (real %, reset times)…", sub=1,
-             open_path="https://github.com/dashpes/burnbar#live-usage")
+        emit("Live usage  not set up", color=MUTED)
+        emit("Set up live limits (real %, reset times)", sub=1,
+             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
 
-    emit("Edit config file…", sub=0, open_path=CONFIG_PATH)
+    emit("Edit config file", sub=0, open_path=CONFIG_PATH)
 
 
 if __name__ == "__main__":
@@ -700,7 +650,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print("⚡ burnbar !")
+        print("burnbar !")
         print("---")
         print(f"Error: {e} | font={MONO} size=13 color=#ff453a")
         import traceback

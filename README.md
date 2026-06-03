@@ -82,14 +82,15 @@ reuse. Set it to `1.0` in the script to count every token equally.
 
 ## Settings (no JSON editing)
 
-Click the menu bar item → **⚙ Settings** to change things live; selections are
-marked with ● and saved to `~/.config/burnbar/config.json`:
+Click the menu bar item → **Settings** to change things live; selections are
+marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 
-- **View** — `Default` (full panel) or `Compact` (just Current Block + Today,
-  with the heavy stats tucked under a *More stats* submenu)
+- **View** — `Default` (full panel) or `Compact` (just Today + a *More stats*
+  submenu)
 - **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
   (recolors the bar + accent text)
-- **Menu-bar tokens** — show/hide the `· 1.1M` token count next to the `%`
+- **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
+  `· 3h40m`), `Token count`, or `None`
 - **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
 
 ## Install

@@ -75,4 +75,4 @@ fi
 # 6. Launch / refresh.
 open -a SwiftBar
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || true
-echo "Done. Look for the burnbar bar in your menu bar; click it for stats + ⚙ Settings."
+echo "Done. Look for the burnbar bar in your menu bar; click it for stats + Settings."
