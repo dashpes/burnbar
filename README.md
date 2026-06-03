@@ -31,64 +31,6 @@ Click it for a **Stats-style dropdown** with SF Symbol section headers:
 - **Recent blocks** — your latest rolling windows, the live one highlighted
 - **Settings** — view, theme, menu-bar trailer & width (no JSON editing)
 
-## How the live limits work
-
-The real numbers aren't in any file that `ccusage`-style tools read — Claude Code
-only exposes them through its **statusLine** (a command it feeds a JSON blob on
-every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
-`~/.config/burnbar/usage.json` and prints a compact status line back to Claude
-Code:
-
-```
-5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
-```
-
-`install.sh` offers to wire it for you. Manual setup — add to
-`~/.claude/settings.json`:
-
-```json
-"statusLine": { "type": "command", "command": "/abs/path/to/burnbar-statusline.py", "padding": 0 }
-```
-
-Because Anthropic computes the limits server-side, the captured values already
-include claude.ai web, Claude Code, and every machine you use — and the reset
-times are exact. They refresh whenever you use Claude Code on this Mac; when
-idle, burnbar shows the last-known reading with an "as of" time. Until the
-bridge is wired, the menu bar shows `set up` and points you here.
-
-> Everything stays on your machine — the bridge only writes a local file. No
-> network calls, no token handling (Claude Code already holds the OAuth token).
-
-## How it works
-
-- **Live limits** come from Anthropic via the statusLine bridge above —
-  `rate_limits` (5-hour / 7-day / Opus) with exact reset times. The menu bar `%`
-  *is* your real 5-hour usage; no estimation involved.
-- **Token stats** are read from `~/.claude/projects/**/*.jsonl` (Claude Code's
-  local transcripts): every assistant turn's `input` / `output` /
-  `cache_creation` / `cache_read`, deduped by message id + request id, grouped
-  into rolling 5-hour blocks and rolled up by day / model / project / session.
-- The menu bar fill bar is colored green → yellow → orange → red as it climbs,
-  followed by a reset countdown (swap to a token count or nothing in Settings).
-
-Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the token
-stats, since they're far lighter than fresh tokens — this makes "effective
-tokens" track real burn rather than cache reuse. Set it to `1.0` to count every
-token equally.
-
-## Settings (no JSON editing)
-
-Click the menu bar item → **Settings** to change things live; selections are
-marked with `[x]` and saved to `~/.config/burnbar/config.json`:
-
-- **View** — `Default` (full panel) or `Compact` (just Today + a *More stats*
-  submenu)
-- **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
-  (recolors the bar + accent text)
-- **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
-  `· 3h40m`), `Token count`, or `None`
-- **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
-
 ## Install
 
 One line, no clone:
@@ -135,6 +77,64 @@ open "swiftbar://refreshallplugins"
 
 The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 `burnbar.10s.py`, etc. to taste. Works with [xbar](https://xbarapp.com) too.
+
+## Settings (no JSON editing)
+
+Click the menu bar item → **Settings** to change things live; selections are
+marked with `[x]` and saved to `~/.config/burnbar/config.json`:
+
+- **View** — `Default` (full panel) or `Compact` (just Today + a *More stats*
+  submenu)
+- **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
+  (recolors the bar + accent text)
+- **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
+  `· 3h40m`), `Token count`, or `None`
+- **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
+
+## How the live limits work
+
+The real numbers aren't in any file that `ccusage`-style tools read — Claude Code
+only exposes them through its **statusLine** (a command it feeds a JSON blob on
+every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
+`~/.config/burnbar/usage.json` and prints a compact status line back to Claude
+Code:
+
+```
+5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
+```
+
+`install.sh` offers to wire it for you. Manual setup — add to
+`~/.claude/settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "/abs/path/to/burnbar-statusline.py", "padding": 0 }
+```
+
+Because Anthropic computes the limits server-side, the captured values already
+include claude.ai web, Claude Code, and every machine you use — and the reset
+times are exact. They refresh whenever you use Claude Code on this Mac; when
+idle, burnbar shows the last-known reading with an "as of" time. Until the
+bridge is wired, the menu bar shows `set up` and points you here.
+
+> Everything stays on your machine — the bridge only writes a local file. No
+> network calls, no token handling (Claude Code already holds the OAuth token).
+
+## How it works
+
+- **Live limits** come from Anthropic via the statusLine bridge above —
+  `rate_limits` (5-hour / 7-day / Opus) with exact reset times. The menu bar `%`
+  *is* your real 5-hour usage; no estimation involved.
+- **Token stats** are read from `~/.claude/projects/**/*.jsonl` (Claude Code's
+  local transcripts): every assistant turn's `input` / `output` /
+  `cache_creation` / `cache_read`, deduped by message id + request id, grouped
+  into rolling 5-hour blocks and rolled up by day / model / project / session.
+- The menu bar fill bar is colored green → yellow → orange → red as it climbs,
+  followed by a reset countdown (swap to a token count or nothing in Settings).
+
+Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the token
+stats, since they're far lighter than fresh tokens — this makes "effective
+tokens" track real burn rather than cache reuse. Set it to `1.0` to count every
+token equally.
 
 ## Footprint
 
