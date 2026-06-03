@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.5.0</bitbar.version>
+# <bitbar.version>0.6.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -25,6 +25,8 @@ items in the Settings submenu (which re-invoke this script with --set).
 import glob
 import json
 import os
+import re
+import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -35,7 +37,12 @@ PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
 CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
-CACHE_VERSION = 4                # bumped: per-file aggregates now carry context info
+UPDATE_PATH = os.path.expanduser("~/.config/burnbar/update.json")  # daily update check
+CACHE_VERSION = 5                # bumped: per-file aggregates now carry context info
+
+UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
+RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
+    "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -50,9 +57,30 @@ CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
 CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
 CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
+CONTEXT_NAME_W = 32              # name column width (titles truncated to fit the tree)
+CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
 MONO = "Menlo"
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
+
+
+def parse_version_header(text):
+    """Pull the version out of a plugin file's BitBar metadata header."""
+    m = re.search(r"<bitbar\.version>([^<]+)</bitbar\.version>", text or "")
+    return m.group(1).strip() if m else None
+
+
+def _read_self_version():
+    try:
+        with open(SELF, encoding="utf-8") as f:
+            return parse_version_header(f.read(2048))
+    except Exception:
+        return None
+
+
+# Single source of truth for the version: the <bitbar.version> header at the top of
+# this file. Bump it there alone — the daily update check and CI release both read it.
+VERSION = _read_self_version() or "0.0.0"
 
 # ── user-configurable defaults (overridden by config.json) ──
 DEFAULTS = {
@@ -62,6 +90,7 @@ DEFAULTS = {
     "title_size": 11,            # menu-bar font size
     "menubar_extra": "countdown",  # trailer after the %: countdown | tokens | none
     "context_window": "auto",    # how to size the context bar: auto | 200k | 1m
+    "update_check": "on",        # daily "is there a newer burnbar?" check: on | off
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 CONTEXT_WINDOWS = ("auto", "200k", "1m")
@@ -108,6 +137,8 @@ def load_config():
         cfg["menubar_extra"] = "countdown"
     if cfg.get("context_window") not in CONTEXT_WINDOWS:
         cfg["context_window"] = "auto"
+    if cfg.get("update_check") not in ("on", "off"):
+        cfg["update_check"] = "on"
     return cfg
 
 
@@ -185,9 +216,9 @@ def context_window(model, peak_ctx, mode):
         return CTX_200K
     if mode == "1m":
         return CTX_1M
-    if "opus" in (model or "").lower():
+    if "opus" in (model or "").lower() or peak_ctx > CTX_200K:
         return CTX_1M
-    return CTX_1M if peak_ctx > CTX_200K else CTX_200K
+    return CTX_200K
 
 
 def ctx_label(win):
@@ -281,6 +312,72 @@ def load_usage():
     return None
 
 
+# ─────────────────────────── update check ───────────────────────────
+def version_tuple(s):
+    """'0.6.0' -> (0, 6, 0); any non-numeric part becomes 0 so compares stay total."""
+    out = []
+    for p in (s or "").split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def fetch_latest_version():
+    """Read just the header of the published plugin and return its <bitbar.version>,
+    or None on any failure. This is the only network call burnbar makes — a plain
+    version GET to GitHub; no usage data ever leaves the machine."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{RAW_BASE}/burnbar.30s.py",
+            headers={"Range": "bytes=0-2047", "User-Agent": "burnbar"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            head = r.read(2048).decode("utf-8", "replace")
+    except Exception:
+        return None
+    return parse_version_header(head)
+
+
+def check_update(cfg, now_epoch):
+    """Return the newer version string if one is available, else None. Refreshes
+    from GitHub at most once a day (the result is cached in update.json); stamps the
+    check time on every attempt so a failure still waits a full day before retrying.
+    Off entirely when the user disables the check."""
+    if cfg.get("update_check") != "on":
+        return None
+    state = {}
+    try:
+        with open(UPDATE_PATH) as f:
+            state = json.load(f)
+    except Exception:
+        pass
+    if now_epoch - state.get("checked", 0) >= UPDATE_INTERVAL:
+        latest = fetch_latest_version()
+        state = {"checked": now_epoch, "latest": latest or state.get("latest")}
+        try:
+            os.makedirs(os.path.dirname(UPDATE_PATH), exist_ok=True)
+            with open(UPDATE_PATH, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+    latest = state.get("latest")
+    if latest and version_tuple(latest) > version_tuple(VERSION):
+        return latest
+    return None
+
+
+def update_command():
+    """How to pull the newest version, matched to how burnbar was installed: a git
+    checkout updates in place; a curl install re-runs the installer (which re-fetches
+    the scripts and refreshes SwiftBar)."""
+    here = os.path.dirname(SELF)
+    if os.path.isdir(os.path.join(here, ".git")):
+        return f"git -C '{here}' pull --ff-only && open 'swiftbar://refreshallplugins'"
+    return f"curl -fsSL '{RAW_BASE}/install.sh' | bash -s -- -y"
+
+
 PLAN_LABEL = {"pro": "Pro", "max5": "Max 5×", "max20": "Max 20×"}
 PLAN = None  # set in main() from ~/.claude.json
 
@@ -312,7 +409,7 @@ def pretty_project(dirname):
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
 def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
-         action=None, args=None, open_path=None, header=False):
+         action=None, args=None, open_path=None, header=False, terminal=False):
     prefix = "--" * sub
     params = [f"font={MONO} size={12 if header else size}"]
     params.append(f"color={color if color is not None else TH['text']}")
@@ -324,7 +421,7 @@ def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
         params.append(f"bash={action}")
         for i, a in enumerate(args or [], 1):
             params.append(f'param{i}="{a}"')
-        params.append("terminal=false")
+        params.append(f"terminal={'true' if terminal else 'false'}")
     if open_path:
         params.append("bash=/usr/bin/open")
         params.append(f'param1="{open_path}"')
@@ -334,6 +431,15 @@ def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
 
 def sep(sub=0):
     print("--" * sub + "---")
+
+
+def emit_update(latest):
+    """A prominent 'a newer burnbar exists' row that updates in place when clicked
+    (opens Terminal so the pull/install is visible)."""
+    emit(f"Update to {latest} (on {VERSION})", color=adaptive(TH["grad"][0]),
+         sfimage="arrow.down.circle.fill",
+         action="/bin/bash", args=["-lc", update_command()], terminal=True)
+    sep()
 
 
 # ─────────────────────────── data load ───────────────────────────
@@ -361,15 +467,19 @@ def parse_file(fp, project, session, tz):
                 o = json.loads(line)
             except Exception:
                 continue
-            if not meta and o.get("sessionId"):
-                # First line carries the session header: cwd (true project), the
-                # parent sessionId (== own id for a main session, parent's for a
-                # subagent), agentId, the sidechain flag that marks subagents, and
-                # the git branch (a cheap differentiator between sibling sessions).
-                meta = {"cwd": o.get("cwd"), "sid": o.get("sessionId"),
-                        "agent_id": o.get("agentId"),
-                        "sidechain": bool(o.get("isSidechain")),
-                        "branch": o.get("gitBranch")}
+            # Session header fields, captured from whichever early line carries
+            # each (they're not all on line 1 — e.g. `cwd` first shows up on the
+            # opening user event, after the `mode` line that has only sessionId).
+            # cwd = true project; sid = own id for a main session / parent's for a
+            # subagent; agentId + sidechain mark subagents; gitBranch differentiates
+            # sibling sessions.
+            if "cwd" not in meta and o.get("cwd"):
+                meta["cwd"] = o.get("cwd")
+                meta["branch"] = o.get("gitBranch")
+            if "sid" not in meta and o.get("sessionId"):
+                meta["sid"] = o.get("sessionId")
+                meta["agent_id"] = o.get("agentId")
+                meta["sidechain"] = bool(o.get("isSidechain"))
             if o.get("type") == "ai-title":
                 # Claude names each session (the title shown in the resume picker);
                 # it's revised over the session, so keep the most recent one.
@@ -608,8 +718,8 @@ def ctx_session_label(sv):
 
 
 def ctx_row(sv, now_ts, mode, agent=False):
-    """One agent's context-window fill. The bar/numbers lead in fixed columns so
-    rows line up; the (variable-length) session title trails."""
+    """One agent's context-window fill, as a tree row: the (truncated) name leads
+    so subagents nest visibly under their parent; bar + numbers + freshness follow."""
     win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
     used = sv.get("last_ctx", 0)
     frac = used / win if win else 0.0
@@ -618,30 +728,97 @@ def ctx_row(sv, now_ts, mode, agent=False):
     when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
     if agent:
         aid = (sv.get("agent_id") or "")[:4]
-        label = f"↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
+        name = f"  ↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
     else:
-        label = ctx_session_label(sv)
-    uw = f"{compact(used)}/{ctx_label(win)}"
-    emit(f"{render_bar(frac, 6)} {pct:>3}% {uw:<9}{when:>6}  {ellipsis(label, 32)}",
-         color=adaptive(color_for(pct)))
+        name = ctx_session_label(sv)
+    emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} {render_bar(frac, 6)} "
+         f"{pct:>3}% {compact(used):>5}/{ctx_label(win)} · {when}",
+         color=adaptive(color_for(pct)), size=CONTEXT_TEXT_SIZE)
+
+
+def live_session_cwds():
+    """Working dirs that have a live Claude Code CLI session, with a count of how
+    many — found by inspecting running `claude` processes (their cwd is the only
+    reliable 'this session is open' signal; the transcript isn't held open and
+    carries no pid). Returns {cwd: count}, {} if none are running, or None if we
+    couldn't look (so the caller can fall back to a time-based guess)."""
+    try:
+        pids = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
+                              capture_output=True, text=True, timeout=2).stdout.split()
+    except Exception:
+        return None
+    if not pids:
+        return {}
+    try:
+        # One lsof for all pids (it's the slow call): each process emits its cwd
+        # as an `n` line, so counting those tallies live sessions per dir.
+        out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn",
+                              "-p", ",".join(pids)],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return None
+    counts = {}
+    for line in out.splitlines():
+        if line.startswith("n"):
+            cwd = os.path.normpath(line[1:])
+            counts[cwd] = counts.get(cwd, 0) + 1
+    return counts
 
 
 def emit_context(by_session, now, cfg):
     """Per-agent context-window usage, so you can see at a glance how much room is
-    left in each running session. 'Agents' = recently-active main sessions plus the
-    subagents they spawned (linked by sessionId), sorted by recency."""
+    left in each running session. 'Agents' = the open main sessions (one per live
+    `claude` process) plus the subagents they're currently running."""
     mode = cfg["context_window"]
     now_ts = now.timestamp()
-    main_cut = now_ts - CONTEXT_ACTIVE_MIN * 60
-    agent_cut = now_ts - CONTEXT_AGENT_MIN * 60
-    mains = sorted(((k, v) for k, v in by_session.items()
-                    if not v.get("agent") and v.get("last_ctx", 0) > 0
-                    and v.get("mtime", 0) >= main_cut),
-                   key=lambda kv: -kv[1]["mtime"])
-    agents = sorted(((k, v) for k, v in by_session.items()
-                     if v.get("agent") and v.get("last_ctx", 0) > 0
-                     and v.get("mtime", 0) >= agent_cut),
-                    key=lambda kv: -kv[1]["mtime"])
+
+    def norm(sv):
+        return os.path.normpath(sv.get("cwd") or "")
+
+    def agent_running(av):
+        # A subagent's parent session blocks while the subagent runs; once the
+        # parent writes again (the tool result) the subagent has finished — so it's
+        # live only until its parent's transcript passes it. Age is a backstop in
+        # case the parent was killed mid-run and never resumes.
+        if now_ts - av.get("mtime", 0) > CONTEXT_AGENT_MIN * 60:
+            return False
+        parent = by_session.get(av.get("sid"))
+        if parent and not parent.get("agent"):
+            return av.get("mtime", 0) >= parent.get("mtime", 0)
+        return True
+
+    # Cheap in-memory candidates first, so we only shell out to find live
+    # processes when there's actually something that could be shown.
+    cand = sorted((kv for kv in by_session.items()
+                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
+                  key=lambda kv: -kv[1]["mtime"])
+    agent_cand = sorted(((k, v) for k, v in by_session.items()
+                         if v.get("agent") and v.get("last_ctx", 0) > 0
+                         and agent_running(v)),
+                        key=lambda kv: -kv[1]["mtime"])
+    if not cand and not agent_cand:
+        return
+
+    proc = live_session_cwds()
+
+    # Main sessions: prefer the precise process signal — for each working dir show
+    # the N most-recently-active sessions where N = live `claude` processes there,
+    # so closed sessions can't linger. If we can't read processes, fall back to a
+    # recency window.
+    if proc is None:
+        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
+    else:
+        budget = dict(proc)
+        mains = []
+        for k, v in cand:
+            c = norm(v)
+            if budget.get(c, 0) > 0:
+                mains.append((k, v))
+                budget[c] -= 1
+
+    # Subagents: still-running ones (parent hasn't resumed) in a live working dir.
+    agents = [kv for kv in agent_cand if proc is None or norm(kv[1]) in proc]
     if not mains and not agents:
         return
     by_parent = {}
@@ -650,14 +827,16 @@ def emit_context(by_session, now, cfg):
 
     emit("CONTEXT · live agents", color=MUTED, sfimage="gauge", header=True)
 
+    shown_agents = set()
+
     def emit_agents(kids):
         for ak, av in kids[:CONTEXT_MAX_AGENTS]:
             ctx_row(av, now_ts, mode, agent=True)
             shown_agents.add(ak)
         if len(kids) > CONTEXT_MAX_AGENTS:
-            emit(f"{'':>29}↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED)
+            emit(f"  ↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
+                 size=CONTEXT_TEXT_SIZE)
 
-    shown_agents = set()
     for key, sv in mains[:CONTEXT_MAX_ROWS]:
         ctx_row(sv, now_ts, mode)
         emit_agents(by_parent.get(key, []))
@@ -681,6 +860,7 @@ def main():
 
     now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
+    update_avail = check_update(cfg, now_epoch)
     tz = datetime.now().astimezone().tzinfo
     today = datetime.now().astimezone(tz).date()
     window = timedelta(hours=BLOCK_HOURS)
@@ -701,6 +881,8 @@ def main():
             print(f"{render_bar(0, cells)} | font={MONO} size={title_size} color={MUTED}")
             sep()
             emit("No Claude Code usage found yet")
+        if update_avail:
+            emit_update(update_avail)
         emit("Refresh", refresh=True)
         settings_menu(cfg)
         return
@@ -750,6 +932,9 @@ def main():
         print(f"{render_bar(0, cells)} set up | "
               f"font={MONO} size={title_size} color={MUTED}")
     sep()
+
+    if update_avail:
+        emit_update(update_avail)
 
     # ════════════════ LIVE LIMITS (real, from Anthropic) ════════════════
     if usage:
@@ -904,6 +1089,11 @@ def settings_menu(cfg):
     for opt, lbl in (("auto", "Auto-detect"), ("200k", "200K"), ("1m", "1M")):
         emit(f"{mark(cfg['context_window']==opt)}{lbl}", sub=1, action=SELF,
              args=["--set", f"context_window={opt}"], refresh=True)
+
+    emit("Check for updates")
+    for opt, lbl in (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")):
+        emit(f"{mark(cfg['update_check']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"update_check={opt}"], refresh=True)
 
     # Live-usage status: on when the statusLine bridge has written real data.
     if load_usage():

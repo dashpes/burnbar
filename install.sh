@@ -98,8 +98,9 @@ OSA
 fi
 
 # 5. Live usage bridge — real 5h/7d limits + reset times, captured from Claude
-#    Code's statusLine (the same data the /usage command shows).
-if [ "$DO_LIVE" = 1 ] && ask "Enable live usage (real limits + reset times via Claude Code statusLine)? [Y/n]" y; then
+#    Code's statusLine (the same data the /usage command shows). The same status
+#    line also shows each session's title, so you can tell terminals/tabs apart.
+if [ "$DO_LIVE" = 1 ] && ask "Enable live usage (real limits + reset times + session title in Claude Code's status bar)? [Y/n]" y; then
   chmod +x "$BRIDGE"
   mkdir -p "$HOME/.claude"
   SETTINGS="$HOME/.claude/settings.json"
@@ -121,7 +122,7 @@ else:
     d["statusLine"] = {"type": "command", "command": bridge, "padding": 0}
     with open(p, "w") as f:
         json.dump(d, f, indent=2)
-    print("  Live usage enabled. It populates on your next Claude Code message.")
+    print("  Live usage + session title enabled. Populates on your next Claude Code message.")
 PY
 fi
 

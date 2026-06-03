@@ -35,6 +35,36 @@ def bar(pct, cells=8):
     return "█" * full + "░" * (cells - full)
 
 
+def session_title(transcript_path, tail_bytes=262144, cap=48):
+    """The session's own title — Claude writes an `ai-title` event (`aiTitle`) to
+    the transcript and revises it as the session goes; we want the latest. Only the
+    file's tail is read so this stays cheap no matter how long the transcript is."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()            # drop the partial first line
+            chunk = f.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    title = None
+    for line in chunk.splitlines():
+        if '"aiTitle"' not in line:     # cheap pre-filter before parsing
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") == "ai-title" and o.get("aiTitle"):
+            title = o["aiTitle"]
+    if title and len(title) > cap:
+        title = title[:cap - 1] + "…"
+    return title
+
+
 def main():
     raw = sys.stdin.read()
     try:
@@ -63,9 +93,13 @@ def main():
         except Exception:
             pass
 
-    # Build the status line shown in Claude Code.
+    # Build the status line shown in Claude Code. Lead with the session's own
+    # title so you can tell which session a given terminal/tab is at a glance.
     now = time.time()
     parts = []
+    title = session_title(data.get("transcript_path"))
+    if title:
+        parts.append(title)
     five = rl.get("five_hour") or {}
     seven = rl.get("seven_day") or {}
     if five:

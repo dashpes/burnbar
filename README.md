@@ -10,7 +10,9 @@ that fills up, right in the macOS menu bar, with a live reset countdown:
 
 It pulls Anthropic's live `rate_limits` (5-hour, 7-day, Opus) and pairs them with
 rich token stats from your own local transcripts. No `ccusage`, no API keys, no
-network calls, no pricing tables — nothing leaves your machine.
+pricing tables, no telemetry — your usage never leaves your machine. (The lone
+exception: an optional once-a-day check to GitHub for a newer version — it sends
+nothing about you, and it's one toggle away in Settings.)
 
 <p align="center">
   <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
@@ -23,10 +25,12 @@ Click it for a **Stats-style dropdown** with SF Symbol section headers:
 
 - **Usage limits (live)** — 5-hour / 7-day / Opus, each a fill bar with exact
   `used_percentage` and time-to-reset, straight from Anthropic (cross-surface)
-- **Context (live agents)** — how full each running session's context window is,
-  so you can see at a glance how much room you have left; each row is labelled
-  with Claude's own session title (the one in the resume picker), with subagents
-  listed under the session that spawned them
+- **Context (live agents)** — how full each *open* session's context window is, so
+  at a glance you can tell which session still has room and which is about to
+  auto-compact. burnbar shows the sessions that are genuinely running (it matches
+  live `claude` processes to their working dir, so a window you closed drops off
+  right away), labels each with Claude's own session title (the one in the resume
+  picker), and nests any subagents under the session that spawned them
 - **Today** — total tokens, messages, sessions, peak hour, hourly sparkline, by model
 - **Last 7 days** — per-day mini bars, week + month totals
 - **All time** — totals, raw vs effective tokens, sessions, projects, daily
@@ -79,6 +83,24 @@ open "swiftbar://refreshallplugins"
 ```
 </details>
 
+## Updating
+
+burnbar checks GitHub for a newer version **at most once a day** (a plain
+version-only GET — nothing about your usage is sent). When one is out, an
+**Update to x.y.z** row appears at the top of the dropdown; clicking it opens a
+Terminal and updates in place — `git pull` for a checkout, or a re-run of
+`install.sh` for a `curl` install — then refreshes SwiftBar.
+
+Don't want the check? Flip **Settings → Check for updates → Off**; burnbar then
+makes no network calls at all. You can always update by hand:
+
+```sh
+# checkout install
+cd /path/to/burnbar && git pull && ./install.sh
+# curl install
+curl -fsSL https://raw.githubusercontent.com/dashpes/burnbar/main/install.sh | bash -s -- -y
+```
+
 The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 `burnbar.10s.py`, etc. to taste. Works with [xbar](https://xbarapp.com) too.
 
@@ -96,6 +118,8 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 - **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
 - **Context window** — how the *Context* section sizes each bar: `Auto-detect`,
   `200K`, or `1M` (see below)
+- **Check for updates** — `Daily` (default; a version-only GET to GitHub, see
+  [Updating](#updating)) or `Off` (no network calls at all)
 
 ## How the live limits work
 
@@ -103,10 +127,10 @@ The real numbers aren't in any file that `ccusage`-style tools read — Claude C
 only exposes them through its **statusLine** (a command it feeds a JSON blob on
 every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
 `~/.config/burnbar/usage.json` and prints a compact status line back to Claude
-Code:
+Code, led by the session's own title so you can tell which terminal/tab is which:
 
 ```
-5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
+Add context tracking to burnbar  5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
 ```
 
 `install.sh` offers to wire it for you. Manual setup — add to
@@ -138,13 +162,17 @@ bridge is wired, the menu bar shows `set up` and points you here.
   followed by a reset countdown (swap to a token count or nothing in Settings).
 - **Context (live agents)** reads the same transcripts: a session's current
   context-window fill is its latest turn's prompt size (`input` +
-  `cache_creation` + `cache_read` — what the model was actually sent). Main
-  sessions touched in the last couple of hours are shown, with the subagents
-  still running underneath them (linked by the `sessionId` in each
-  `agent-*.jsonl`). Rows are labelled with Claude's auto-generated session title
-  (the `aiTitle` it writes to the transcript and shows in the resume picker),
-  falling back to the project folder and git branch. The bar reddens as the
-  window fills, so a session about to compact stands out.
+  `cache_creation` + `cache_read` — what the model was actually sent). To show
+  only sessions that are *actually open*, burnbar matches each running `claude`
+  process to its working directory (`pgrep` + `lsof`) instead of guessing from
+  recency — so a window you just closed disappears immediately, and two terminals
+  in the same repo are counted separately; if it can't read processes it falls
+  back to a recent-activity window. Subagents still running are nested under the
+  session that spawned them (linked by the `sessionId` in each `agent-*.jsonl`)
+  and drop off the moment they finish. Rows are labelled with Claude's
+  auto-generated session title (the `aiTitle` it writes to the transcript and
+  shows in the resume picker), falling back to the project folder and git branch.
+  The bar reddens as the window fills, so a session about to compact stands out.
 
 Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
 by the model running the latest turn: Opus is the 1M-context model, so an Opus

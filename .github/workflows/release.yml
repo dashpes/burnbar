@@ -1,0 +1,41 @@
+name: release
+
+# When a merge lands on main with a new <bitbar.version>, tag it and publish a
+# GitHub Release with auto-generated notes. Idempotent: if a tag for the current
+# version already exists, this is a no-op — so a merge that doesn't bump the
+# version simply releases nothing.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from header
+        id: v
+        run: |
+          ver=$(grep -oE '<bitbar\.version>[^<]+' burnbar.30s.py | sed 's/.*>//')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Version on main: $ver"
+
+      - name: Tag + release if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.v.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists — nothing to release."
+            exit 0
+          fi
+          git tag "$tag"
+          git push origin "$tag"
+          gh release create "$tag" --title "$tag" --generate-notes
+          echo "Published $tag."
