@@ -95,15 +95,37 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 
 ## Install
 
+One line, no clone:
+
 ```sh
-git clone https://github.com/dashpes/burnbar.git
-cd burnbar
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/dashpes/burnbar/main/install.sh | bash
 ```
 
-`install.sh` will: install SwiftBar (via Homebrew) if missing, symlink the
-plugin into SwiftBar's folder, offer to **launch SwiftBar at login** (so burnbar
-runs on startup), and refresh. That's it.
+This downloads the two scripts into `~/.local/share/burnbar`, then does the rest.
+Prefer a checkout (so `git pull` updates it)? That works too:
+
+```sh
+git clone https://github.com/dashpes/burnbar.git && cd burnbar && ./install.sh
+```
+
+Either way `install.sh` will: install SwiftBar (via Homebrew) if missing, symlink
+the plugin into SwiftBar's folder, offer to **launch SwiftBar at login** (so
+burnbar runs on startup), offer to wire **live usage**, and refresh. That's it.
+
+**Unattended / flags** — take every default with no prompts:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dashpes/burnbar/main/install.sh | bash -s -- -y
+```
+
+| Flag         | Effect                                              |
+| ------------ | --------------------------------------------------- |
+| `-y, --yes`  | non-interactive; take the default for every prompt  |
+| `--no-login` | skip the SwiftBar login item                        |
+| `--no-live`  | skip wiring the live-usage statusLine bridge        |
+
+> When piped through `curl`, prompts read from your terminal (`/dev/tty`); with
+> no terminal it falls back to the defaults, same as `-y`.
 
 <details>
 <summary>Manual install</summary>
@@ -141,7 +163,7 @@ top of `burnbar.30s.py`:
 | `BLOCK_HOURS`       | `5`       | Length of a usage block                      |
 | `BAR_CELLS`         | `10`      | Bar width inside the dropdown                |
 | `CACHE_READ_WEIGHT` | `0.1`     | Weight applied to cache-read tokens          |
-| `RECENT_DAYS`       | `21`      | Files newer than this are always re-parsed   |
+| `RECENT_DAYS`       | `3`       | Recent window re-parsed each refresh (lean)  |
 | `THEMES`            | —         | Add your own `name: {grad, text, muted}`     |
 
 ## License

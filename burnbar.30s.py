@@ -36,8 +36,10 @@ CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
 CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
 CACHE_VERSION = 1
-RECENT_DAYS = 21                 # files newer than this are re-parsed every refresh;
-#                                  older ones are read once and served from cache.
+RECENT_DAYS = 3                  # keep it lean: only files newer than this are
+#                                  re-parsed each refresh (for recent blocks); older
+#                                  ones are read once and served from cache. Smaller
+#                                  = less CPU/RAM per refresh, shorter recent history.
 CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight burn
 MONO = "Menlo"
 MUTED = "#8e8e93"                # section headers / secondary notes
