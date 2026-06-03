@@ -12,7 +12,12 @@ It pulls Anthropic's live `rate_limits` (5-hour, 7-day, Opus) and pairs them wit
 rich token stats from your own local transcripts. No `ccusage`, no API keys, no
 network calls, no pricing tables — nothing leaves your machine.
 
-![burnbar](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" alt="burnbar default view" width="370">
+  &nbsp;&nbsp;
+  <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
+</p>
+<p align="center"><em>Default view (left) and Compact view (right).</em></p>
 
 Click it for a **Stats-style dropdown** with SF Symbol section headers:
 
