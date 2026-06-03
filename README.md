@@ -45,35 +45,55 @@ Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) since they're fa
 lighter than fresh tokens — this makes the bar track real burn rather than cache
 reuse. Set it to `1.0` in the script to count every token equally.
 
+## Settings (no JSON editing)
+
+Click the menu bar item → **⚙ Settings** to change things live; selections are
+marked with ● and saved to `~/.config/burnbar/config.json`:
+
+- **View** — `Default` (full panel) or `Compact` (just Current Block + Today,
+  with the heavy stats tucked under a *More stats* submenu)
+- **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
+  (recolors the bar + accent text)
+- **Menu-bar tokens** — show/hide the `· 1.1M` token count next to the `%`
+- **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
+
 ## Install
 
-1. Install SwiftBar:
-   ```sh
-   brew install --cask swiftbar
-   ```
-2. Launch SwiftBar once and pick a plugin folder when prompted (e.g.
-   `~/.swiftbar`).
-3. Symlink the plugin into that folder (or run `./install.sh`):
-   ```sh
-   ln -sf "$PWD/burnbar.30s.py" ~/.swiftbar/burnbar.30s.py
-   ```
-4. In SwiftBar, **Refresh All**. Done.
+```sh
+git clone https://github.com/dashpes/burnbar.git
+cd burnbar
+./install.sh
+```
+
+`install.sh` will: install SwiftBar (via Homebrew) if missing, symlink the
+plugin into SwiftBar's folder, offer to **launch SwiftBar at login** (so burnbar
+runs on startup), and refresh. That's it.
+
+<details>
+<summary>Manual install</summary>
+
+```sh
+brew install --cask swiftbar          # then launch & pick a plugin folder
+ln -sf "$PWD/burnbar.30s.py" ~/.swiftbar/burnbar.30s.py
+open "swiftbar://refreshallplugins"
+```
+</details>
 
 The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
-`burnbar.10s.py`, etc. to taste.
-
-> Works with [xbar](https://xbarapp.com) too — same plugin format.
+`burnbar.10s.py`, etc. to taste. Works with [xbar](https://xbarapp.com) too.
 
 ## Tuning
 
-All knobs are constants at the top of `burnbar.30s.py`:
+The Settings submenu covers the common knobs. Deeper ones are constants at the
+top of `burnbar.30s.py`:
 
 | Constant            | Default   | Meaning                                      |
 | ------------------- | --------- | -------------------------------------------- |
 | `BLOCK_HOURS`       | `5`       | Length of a usage block                      |
-| `BAR_CELLS`         | `10`      | Width of the menu-bar bar                    |
+| `BAR_CELLS`         | `10`      | Bar width inside the dropdown                |
 | `CACHE_READ_WEIGHT` | `0.1`     | Weight applied to cache-read tokens          |
 | `PEAK_FLOOR`        | `300_000` | Min denominator before history kicks in      |
+| `THEMES`            | —         | Add your own `name: (low, mid, high, max)`   |
 
 ## License
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.2.0</bitbar.version>
+# <bitbar.version>0.3.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
-# <bitbar.desc>Claude Code usage: 5-hour-block burn bar + full stats dropdown.</bitbar.desc>
+# <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
 # <swiftbar.hideAbout>false</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
@@ -12,35 +12,104 @@
 burnbar — a SwiftBar/xbar plugin.
 
 Menu bar:  a live progress bar for your current Claude Code 5-hour usage block.
-Dropdown:  a full Stats-style panel — current block, today, last 7 days, all
-           time, by model, by project, by hour, and records.
+Dropdown:  a Stats-style panel (compact or full), with an in-menu Settings
+           submenu for theme / view / bar width — no JSON editing required.
 
 All from Claude Code's own local transcripts (~/.claude/projects/**/*.jsonl).
 No ccusage, no API keys, no network, no pricing.
+
+Settings are stored in ~/.config/burnbar/config.json and changed by clicking
+items in the ⚙ Settings submenu (which re-invoke this script with --set).
 """
 
 import glob
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
-# ─────────────────────────── config ───────────────────────────
+# ─────────────────────────── fixed config ───────────────────────────
 BLOCK_HOURS = 5
 BAR_CELLS = 10                   # bar width inside the dropdown
-MENUBAR_CELLS = 5                # bar width in the menu bar itself (smaller)
-TITLE_SIZE = 11                  # font size of the menu-bar title
-SHOW_MENUBAR_TOKENS = False      # also show compact token count next to the %
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 STATE_PATH = os.path.expanduser("~/.config/burnbar/state.json")
+CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight burn
 PEAK_FLOOR = 300_000             # floor for the auto-calibrated 100% baseline
 MONO = "Menlo"
-FONT = f"font={MONO} size=13"
-HEADER_FONT = f"font={MONO} size=12"
-TITLE_FONT = f"font={MONO} size={TITLE_SIZE}"
-# Adaptive high-contrast text (light,dark) so info rows aren't greyed out.
-PRIMARY = "#1d1d1f,#f5f5f7"
-MUTED = "#8e8e93"                 # section headers / secondary notes
+PRIMARY = "#1d1d1f,#f5f5f7"      # adaptive (light,dark) high-contrast body text
+MUTED = "#8e8e93"                # section headers / secondary notes
+SELF = os.path.realpath(__file__)
+
+# ── user-configurable defaults (overridden by config.json) ──
+DEFAULTS = {
+    "view": "default",           # "default" | "compact"
+    "theme": "default",          # see THEMES
+    "menubar_cells": 5,          # bar width in the menu bar
+    "title_size": 11,            # menu-bar font size
+    "show_menubar_tokens": False,
+}
+
+# ── themes: (low, mid, high, max) gradient for the bar + alert accents ──
+THEMES = {
+    "default":   ("#30d158", "#ffd60a", "#ff9f0a", "#ff453a"),
+    "mono":      ("#8e8e93", "#aeaeb2", "#d1d1d6", "#f5f5f7"),
+    "nord":      ("#a3be8c", "#ebcb8b", "#d08770", "#bf616a"),
+    "dracula":   ("#50fa7b", "#f1fa8c", "#ffb86c", "#ff5555"),
+    "solarized": ("#859900", "#b58900", "#cb4b16", "#dc322f"),
+    "matrix":    ("#39ff14", "#32e60f", "#28b80c", "#1f8f08"),
+}
+
+# Module-level theme; set in main() once config is loaded.
+TH = THEMES["default"]
+
+
+# ─────────────────────────── config i/o ───────────────────────────
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    if cfg.get("theme") not in THEMES:
+        cfg["theme"] = "default"
+    if cfg.get("view") not in ("default", "compact"):
+        cfg["view"] = "default"
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+def coerce(key, value):
+    if key in ("menubar_cells", "title_size"):
+        try:
+            return max(1, int(value))
+        except ValueError:
+            return DEFAULTS[key]
+    if key == "show_menubar_tokens":
+        return str(value).lower() in ("1", "true", "yes", "on")
+    return value
+
+
+def handle_cli(argv):
+    """`--set key=value [key=value ...]` writes config; SwiftBar refreshes after."""
+    if argv and argv[0] == "--set":
+        cfg = load_config()
+        for kv in argv[1:]:
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                if k in DEFAULTS:
+                    cfg[k] = coerce(k, v)
+        save_config(cfg)
+
 
 # ─────────────────────────── helpers ───────────────────────────
 def parse_ts(s):
@@ -79,14 +148,16 @@ def add_tokens(dst, u):
     dst["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
 
 
-def merge(dst, src):
-    for k in dst:
-        dst[k] += src[k]
-
-
 def weighted(t):
     return (t["input"] + t["output"] + t["cache_creation"]
             + t["cache_read"] * CACHE_READ_WEIGHT)
+
+
+def weighted_one(u):
+    return ((u.get("input_tokens", 0) or 0)
+            + (u.get("output_tokens", 0) or 0)
+            + (u.get("cache_creation_input_tokens", 0) or 0)
+            + (u.get("cache_read_input_tokens", 0) or 0) * CACHE_READ_WEIGHT)
 
 
 def raw_total(t):
@@ -114,27 +185,30 @@ def pretty_project(dirname):
     p = dirname.replace("-", "/")
     home = os.path.expanduser("~")
     if p.startswith(home):
-        p = "~" + p[len(home):]
-    base = p.rstrip("/").split("/")[-1] or p
-    return base
+        rest = p[len(home):].strip("/")
+        return rest.split("/")[-1] if rest else "home"
+    base = p.rstrip("/").split("/")[-1]
+    return base or p
 
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
-def emit(text, sub=0, color=None, sfimage=None, refresh=False,
-         bash=None, param1=None, header=False):
+def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
+         action=None, args=None, open_path=None, header=False):
     prefix = "--" * sub
-    params = [HEADER_FONT if header else FONT]
-    if color is None:
-        color = PRIMARY          # force readable contrast on plain info rows
-    params.append(f"color={color}")
+    params = [f"font={MONO} size={12 if header else size}"]
+    params.append(f"color={color if color is not None else PRIMARY}")
     if sfimage:
         params.append(f"sfimage={sfimage}")
     if refresh:
         params.append("refresh=true")
-    if bash:
-        params.append(f"bash={bash}")
-    if param1 is not None:
-        params.append(f'param1="{param1}"')
+    if action:
+        params.append(f"bash={action}")
+        for i, a in enumerate(args or [], 1):
+            params.append(f'param{i}="{a}"')
+        params.append("terminal=false")
+    if open_path:
+        params.append("bash=/usr/bin/open")
+        params.append(f'param1="{open_path}"')
         params.append("terminal=false")
     print(f"{prefix}{text} | {' '.join(params)}")
 
@@ -145,7 +219,6 @@ def sep(sub=0):
 
 # ─────────────────────────── data load ───────────────────────────
 def load_records():
-    """Deduped assistant turns: list of dict(ts, model, usage, project, session)."""
     seen = set()
     out = []
     for fp in glob.glob(PROJECTS_GLOB, recursive=True):
@@ -176,10 +249,8 @@ def load_records():
                     continue
                 seen.add(key)
                 try:
-                    out.append({
-                        "ts": parse_ts(ts), "model": msg.get("model", "?"),
-                        "u": u, "project": project, "session": session,
-                    })
+                    out.append({"ts": parse_ts(ts), "model": msg.get("model", "?"),
+                                "u": u, "project": project, "session": session})
                 except Exception:
                     continue
     out.sort(key=lambda r: r["ts"])
@@ -206,7 +277,7 @@ def build_blocks(records):
 
 
 # ─────────────────────────── bars / charts ───────────────────────────
-def render_bar(frac, cells=BAR_CELLS):
+def render_bar(frac, cells):
     frac = max(0.0, min(1.0, frac))
     filled = frac * cells
     full = int(filled)
@@ -226,27 +297,29 @@ def spark(values):
     mx = max(values) if values else 0
     if mx <= 0:
         return "·" * len(values)
-    out = []
-    for v in values:
-        if v <= 0:
-            out.append("·")
-        else:
-            out.append(ticks[min(7, int(v / mx * 7 + 0.999))])
-    return "".join(out)
+    return "".join("·" if v <= 0 else ticks[min(7, int(v / mx * 7 + 0.999))]
+                   for v in values)
 
 
 def color_for(pct):
     if pct >= 90:
-        return "#ff453a"
+        return TH[3]
     if pct >= 70:
-        return "#ff9f0a"
+        return TH[2]
     if pct >= 40:
-        return "#ffd60a"
-    return "#30d158"
+        return TH[1]
+    return TH[0]
 
 
 # ─────────────────────────── main ───────────────────────────
 def main():
+    global TH
+    cfg = load_config()
+    TH = THEMES[cfg["theme"]]
+    cells = cfg["menubar_cells"]
+    title_size = cfg["title_size"]
+    compact_view = cfg["view"] == "compact"
+
     now = datetime.now(timezone.utc)
     tz = datetime.now().astimezone().tzinfo
     today = datetime.now().astimezone(tz).date()
@@ -256,11 +329,11 @@ def main():
     state = load_state()
 
     if not records:
-        emit("⚡ burnbar")
+        print(f"{render_bar(0, cells)} | font={MONO} size={title_size} color={MUTED}")
         sep()
         emit("No Claude Code usage found yet")
-        emit(f"Looked in {PROJECTS_GLOB}")
         emit("Refresh", refresh=True)
+        settings_menu(cfg)
         return
 
     blocks = build_blocks(records)
@@ -268,15 +341,14 @@ def main():
     # ── aggregations ──
     all_tok, all_msgs = new_tokens(), len(records)
     by_model_all, by_project, by_session = {}, {}, {}
-    by_day = {}            # date -> [weighted, msgs]
+    by_day = {}
     hour_profile = [0.0] * 24
     today_tok, today_msgs, today_models = new_tokens(), 0, {}
     today_hours = [0.0] * 24
     today_sessions = set()
     month = today.replace(day=1)
-    month_w = 0.0
+    month_w = week_w = 0.0
     week_start = today - timedelta(days=6)
-    week_w = 0.0
 
     for r in records:
         u, ts = r["u"], r["ts"]
@@ -284,21 +356,20 @@ def main():
         d, hr = lts.date(), lts.hour
         add_tokens(all_tok, u)
         add_tokens(by_model_all.setdefault(r["model"], new_tokens()), u)
-        proj = by_project.setdefault(r["project"], {"t": new_tokens(), "m": 0,
-                                                    "s": set()})
+        proj = by_project.setdefault(r["project"],
+                                     {"t": new_tokens(), "m": 0, "s": set()})
         add_tokens(proj["t"], u); proj["m"] += 1; proj["s"].add(r["session"])
-        sess = by_session.setdefault(r["session"], {"t": new_tokens(), "m": 0,
-                                                    "p": r["project"], "last": ts})
-        add_tokens(sess["t"], u); sess["m"] += 1
-        sess["last"] = max(sess["last"], ts)
+        ssn = by_session.setdefault(r["session"],
+                                    {"t": new_tokens(), "m": 0, "p": r["project"],
+                                     "last": ts})
+        add_tokens(ssn["t"], u); ssn["m"] += 1; ssn["last"] = max(ssn["last"], ts)
         wt = weighted_one(u)
         agg = by_day.setdefault(d, [0.0, 0]); agg[0] += wt; agg[1] += 1
         hour_profile[hr] += wt
         if d == today:
             add_tokens(today_tok, u); today_msgs += 1
             add_tokens(today_models.setdefault(r["model"], new_tokens()), u)
-            today_hours[hr] += wt
-            today_sessions.add(r["session"])
+            today_hours[hr] += wt; today_sessions.add(r["session"])
         if d >= month:
             month_w += wt
         if d >= week_start:
@@ -309,56 +380,57 @@ def main():
     active = last if now - last["start"] < window else None
     all_w = [weighted(b["tokens"]) for b in blocks]
     completed_w = [weighted(b["tokens"]) for b in blocks if b is not active]
-    # Persisted high-water mark only folds in COMPLETED blocks, so a still-
-    # growing active block isn't locked in until it's done.
     if completed_w:
         np = max(state.get("peak", 0), max(completed_w))
         if np != state.get("peak", 0):
             state["peak"] = np
             save_state(state)
-    # Denominator INCLUDES the active block, so the bar can never exceed 100%:
-    # 100% means "burning as hard as you ever have".
     peak = max(all_w + [state.get("peak", 0), PEAK_FLOOR])
 
-    # ── records / peaks ──
     peak_block = max(blocks, key=lambda b: weighted(b["tokens"]))
     busiest_day = max(by_day.items(), key=lambda kv: kv[1][0])
 
     # ════════════════ MENU BAR TITLE ════════════════
     if active is None:
-        print(f"{render_bar(0, MENUBAR_CELLS)} idle | {TITLE_FONT} color=#8e8e93")
+        print(f"{render_bar(0, cells)} idle | "
+              f"font={MONO} size={title_size} color={MUTED}")
     else:
         burn = weighted(active["tokens"])
         frac = min(1.0, burn / peak) if peak else 0
         pct = min(100, round(frac * 100))
-        extra = f" · {compact(burn)}" if SHOW_MENUBAR_TOKENS else ""
-        print(f"{render_bar(frac, MENUBAR_CELLS)} {pct}%{extra} | "
-              f"{TITLE_FONT} color={color_for(pct)}")
+        extra = f" · {compact(burn)}" if cfg["show_menubar_tokens"] else ""
+        print(f"{render_bar(frac, cells)} {pct}%{extra} | "
+              f"font={MONO} size={title_size} color={color_for(pct)}")
     sep()
 
     # ════════════════ CURRENT BLOCK ════════════════
-    emit("CURRENT 5-HOUR BLOCK", color="#8e8e93", sfimage="gauge.with.dots.needle.bottom.50percent", header=True)
+    emit("CURRENT 5-HOUR BLOCK", color=MUTED,
+         sfimage="gauge.with.dots.needle.bottom.50percent", header=True)
     if active is None:
-        emit(f"Idle · last activity {fmt_dur(now - last['last'])} ago",
-             color="#8e8e93")
+        emit(f"Idle · last activity {fmt_dur(now - last['last'])} ago", color=MUTED)
     else:
         burn = weighted(active["tokens"])
         pct = min(100, round(burn / peak * 100)) if peak else 0
         end = active["start"] + window
-        elapsed = now - active["start"]
-        elapsed_min = max(1.0, elapsed.total_seconds() / 60)
+        elapsed_min = max(1.0, (now - active["start"]).total_seconds() / 60)
         rate = burn / elapsed_min
         projected = rate * BLOCK_HOURS * 60
         s_l = active["start"].astimezone(tz).strftime("%H:%M")
         e_l = end.astimezone(tz).strftime("%H:%M")
-        emit(f"{render_bar(burn/peak if peak else 0)}  {pct}% of peak")
-        emit(f"Burn        {compact(burn):>8} tok")
-        emit(f"Messages    {active['msgs']:>8}")
-        emit(f"Window      {s_l}–{e_l}")
-        emit(f"Resets in   {fmt_dur(end - now):>8}", color=color_for(pct))
-        emit(f"Rate        {compact(rate):>8} tok/min")
-        emit(f"Projected   {compact(projected):>8} tok @ block end",
-             color=color_for(round(projected / peak * 100) if peak else 0))
+        if compact_view:
+            emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  "
+                 f"{pct}% · {compact(burn)} tok")
+            emit(f"Resets {fmt_dur(end - now)} · {compact(rate)}/min",
+                 color=color_for(pct))
+        else:
+            emit(f"{render_bar(burn/peak if peak else 0, BAR_CELLS)}  {pct}% of peak")
+            emit(f"Burn        {compact(burn):>8} tok")
+            emit(f"Messages    {active['msgs']:>8}")
+            emit(f"Window      {s_l}–{e_l}")
+            emit(f"Resets in   {fmt_dur(end - now):>8}", color=color_for(pct))
+            emit(f"Rate        {compact(rate):>8} tok/min")
+            emit(f"Projected   {compact(projected):>8} tok @ block end",
+                 color=color_for(round(projected / peak * 100) if peak else 0))
         emit("Breakdown")
         for lbl, k in [("Input", "input"), ("Output", "output"),
                        ("Cache write", "cache_creation"),
@@ -367,29 +439,59 @@ def main():
         emit("By model")
         for m, mt in sorted(active["by_model"].items(),
                             key=lambda kv: -weighted(kv[1])):
-            emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}",
-                 sub=1)
+            emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
     sep()
 
     # ════════════════ TODAY ════════════════
-    emit("TODAY", color="#8e8e93", sfimage="calendar", header=True)
-    emit(f"Total       {compact(weighted(today_tok)):>8} tok")
-    emit(f"Messages    {today_msgs:>8}")
-    emit(f"Sessions    {len(today_sessions):>8}")
-    busy_hr = today_hours.index(max(today_hours)) if any(today_hours) else None
-    if busy_hr is not None:
-        emit(f"Peak hour   {busy_hr:02d}:00")
-    emit(f"By hour  {spark(today_hours)}")
-    emit("By model")
-    for m, mt in sorted(today_models.items(), key=lambda kv: -weighted(kv[1])):
-        emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
+    emit("TODAY", color=MUTED, sfimage="calendar", header=True)
+    if compact_view:
+        emit(f"{compact(weighted(today_tok))} tok · {today_msgs} msgs · "
+             f"{len(today_sessions)} sessions")
+        emit(f"By hour  {spark(today_hours)}")
+    else:
+        emit(f"Total       {compact(weighted(today_tok)):>8} tok")
+        emit(f"Messages    {today_msgs:>8}")
+        emit(f"Sessions    {len(today_sessions):>8}")
+        if any(today_hours):
+            emit(f"Peak hour   {today_hours.index(max(today_hours)):02d}:00")
+        emit(f"By hour  {spark(today_hours)}")
+        emit("By model")
+        for m, mt in sorted(today_models.items(), key=lambda kv: -weighted(kv[1])):
+            emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
     sep()
 
-    # ════════════════ LAST 7 DAYS ════════════════
-    emit("LAST 7 DAYS", color="#8e8e93", sfimage="chart.bar.fill", header=True)
+    if compact_view:
+        # ── compact: tuck the heavy stats behind one submenu ──
+        emit("More stats", sfimage="chart.bar.fill")
+        emit(f"Week total   {compact(week_w):>8} tok", sub=1)
+        emit(f"Month total  {compact(month_w):>8} tok", sub=1)
+        emit(f"All-time     {compact(weighted(all_tok)):>8} tok", sub=1)
+        emit(f"Messages     {all_msgs:>8}", sub=1)
+        emit(f"Sessions     {len(by_session):>8}", sub=1)
+        emit(f"Peak block   {compact(weighted(peak_block['tokens'])):>8} tok", sub=1)
+        bd, (bw, _bm) = busiest_day
+        emit(f"Busiest day  {compact(bw):>8} tok", sub=1)
+        sep()
+    else:
+        emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
+                           hour_profile, all_tok, all_msgs, records, today, tz,
+                           week_w, month_w, peak, peak_block, busiest_day, active, now)
+
+    settings_menu(cfg)
+    sep()
+    emit("Refresh", refresh=True, sfimage="arrow.clockwise")
+    emit("Open transcripts folder", sfimage="folder",
+         open_path=os.path.expanduser("~/.claude/projects"))
+
+
+def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
+                       hour_profile, all_tok, all_msgs, records, today, tz,
+                       week_w, month_w, peak, peak_block, busiest_day, active, now):
+    # LAST 7 DAYS
+    emit("LAST 7 DAYS", color=MUTED, sfimage="chart.bar.fill", header=True)
     days = sorted(by_day.items(), reverse=True)[:7]
     daymax = max((v[0] for _, v in days), default=1) or 1
-    for d, (tok, msgs) in days:
+    for d, (tok, _msgs) in days:
         tag = "  ·today" if d == today else ""
         emit(f"{d.strftime('%a %m-%d')} {render_bar(tok/daymax, 8)} "
              f"{compact(tok):>6}{tag}")
@@ -397,10 +499,10 @@ def main():
     emit(f"Month total {compact(month_w):>8} tok")
     sep()
 
-    # ════════════════ ALL TIME ════════════════
+    # ALL TIME
     first = records[0]["ts"].astimezone(tz)
     span_days = (today - first.date()).days + 1
-    emit("ALL TIME", color="#8e8e93", sfimage="clock.arrow.circlepath", header=True)
+    emit("ALL TIME", color=MUTED, sfimage="clock.arrow.circlepath", header=True)
     emit(f"Total       {compact(weighted(all_tok)):>8} tok")
     emit(f"Raw tokens  {compact(raw_total(all_tok)):>8}")
     emit(f"Messages    {all_msgs:>8}")
@@ -416,54 +518,77 @@ def main():
     for p, pv in sorted(by_project.items(), key=lambda kv: -weighted(kv[1]["t"]))[:12]:
         emit(f"{p[:18]:<18}{compact(weighted(pv['t'])):>8}", sub=1)
     emit("Top sessions")
-    top_sess = sorted(by_session.items(), key=lambda kv: -weighted(kv[1]["t"]))[:8]
-    for sid, sv in top_sess:
+    for _sid, sv in sorted(by_session.items(),
+                           key=lambda kv: -weighted(kv[1]["t"]))[:8]:
         when = sv["last"].astimezone(tz).strftime("%m-%d")
         emit(f"{sv['p'][:12]:<12} {when} {compact(weighted(sv['t'])):>7} "
              f"{sv['m']:>4}m", sub=1)
     sep()
 
-    # ════════════════ RECORDS ════════════════
-    emit("RECORDS", color="#8e8e93", sfimage="trophy.fill", header=True)
+    # RECORDS
+    emit("RECORDS", color=MUTED, sfimage="trophy.fill", header=True)
     pb_when = peak_block["start"].astimezone(tz).strftime("%Y-%m-%d %H:%M")
     emit(f"Peak block  {compact(weighted(peak_block['tokens'])):>8} tok")
-    emit(f"            {pb_when}", color="#8e8e93")
+    emit(f"            {pb_when}", color=MUTED)
     bd, (bw, bm) = busiest_day
     emit(f"Busiest day {compact(bw):>8} tok")
-    emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color="#8e8e93")
+    emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED)
     emit(f"Calibrated  {compact(peak):>8} tok = 100%")
     sep()
 
-    # ════════════════ RECENT BLOCKS ════════════════
+    # RECENT BLOCKS
     emit("Recent blocks")
     for b in list(reversed(blocks))[:10]:
         s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
         live = " ● live" if (b is blocks[-1] and active is not None) else ""
         emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
-             sub=1, color="#30d158" if live else None)
+             sub=1, color=TH[0] if live else None)
     sep()
 
-    emit("Refresh", refresh=True, sfimage="arrow.clockwise")
-    emit("Open transcripts folder", bash="/usr/bin/open",
-         param1=os.path.expanduser("~/.claude/projects"),
-         sfimage="folder")
 
+def settings_menu(cfg):
+    sep()
+    emit("⚙ Settings", color=MUTED, sfimage="gearshape", header=True)
 
-def weighted_one(u):
-    return ((u.get("input_tokens", 0) or 0)
-            + (u.get("output_tokens", 0) or 0)
-            + (u.get("cache_creation_input_tokens", 0) or 0)
-            + (u.get("cache_read_input_tokens", 0) or 0) * CACHE_READ_WEIGHT)
+    def mark(active):
+        return "● " if active else "○ "
+
+    emit("View")
+    emit(f"{mark(cfg['view']=='default')}Default", sub=1, action=SELF,
+         args=["--set", "view=default"], refresh=True)
+    emit(f"{mark(cfg['view']=='compact')}Compact", sub=1, action=SELF,
+         args=["--set", "view=compact"], refresh=True)
+
+    emit("Theme")
+    for name in THEMES:
+        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1, action=SELF,
+             args=["--set", f"theme={name}"], refresh=True)
+
+    emit("Menu-bar tokens")
+    emit(f"{mark(cfg['show_menubar_tokens'])}Show", sub=1, action=SELF,
+         args=["--set", "show_menubar_tokens=true"], refresh=True)
+    emit(f"{mark(not cfg['show_menubar_tokens'])}Hide", sub=1, action=SELF,
+         args=["--set", "show_menubar_tokens=false"], refresh=True)
+
+    emit("Menu-bar width")
+    for w in (3, 5, 8, 10):
+        emit(f"{mark(cfg['menubar_cells']==w)}{w}", sub=1, action=SELF,
+             args=["--set", f"menubar_cells={w}"], refresh=True)
+
+    emit("Edit config file…", sub=0, open_path=CONFIG_PATH)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        handle_cli(sys.argv[1:])
+        sys.exit(0)
     try:
         main()
     except Exception as e:
         print("⚡ burnbar !")
         print("---")
-        print(f"Error: {e} | {FONT} color=#ff453a")
+        print(f"Error: {e} | font={MONO} size=13 color=#ff453a")
         import traceback
         for ln in traceback.format_exc().splitlines():
-            print(f"{ln} | {FONT} size=10")
+            print(f"{ln} | font={MONO} size=10")
         print("Refresh | refresh=true")
