@@ -118,6 +118,19 @@ open "swiftbar://refreshallplugins"
 The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 `burnbar.10s.py`, etc. to taste. Works with [xbar](https://xbarapp.com) too.
 
+## Footprint
+
+burnbar creates no growing files of its own — `usage.json`, `config.json`, and
+`cache.json` are all fixed-size or overwritten. The transcripts it reads are
+written and owned by Claude Code, not burnbar.
+
+To stay fast no matter how large that history grows, burnbar keeps an
+**incremental cache** (`~/.config/burnbar/cache.json`): each transcript's totals
+are cached by size + mtime, so a refresh only re-parses files that are new or
+changed (or modified within `RECENT_DAYS`). Entries for deleted files are pruned
+automatically. In practice a refresh stays in the tens of milliseconds even with
+years of history.
+
 ## Tuning
 
 The Settings submenu covers the common knobs. Deeper ones are constants at the
@@ -128,8 +141,8 @@ top of `burnbar.30s.py`:
 | `BLOCK_HOURS`       | `5`       | Length of a usage block                      |
 | `BAR_CELLS`         | `10`      | Bar width inside the dropdown                |
 | `CACHE_READ_WEIGHT` | `0.1`     | Weight applied to cache-read tokens          |
-| `PEAK_FLOOR`        | `300_000` | Min denominator before history kicks in      |
-| `THEMES`            | —         | Add your own `name: (low, mid, high, max)`   |
+| `RECENT_DAYS`       | `21`      | Files newer than this are always re-parsed   |
+| `THEMES`            | —         | Add your own `name: {grad, text, muted}`     |
 
 ## License
 

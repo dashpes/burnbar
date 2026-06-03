@@ -26,19 +26,20 @@ import glob
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 # ─────────────────────────── fixed config ───────────────────────────
 BLOCK_HOURS = 5
 BAR_CELLS = 10                   # bar width inside the dropdown
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
-STATE_PATH = os.path.expanduser("~/.config/burnbar/state.json")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
+CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
+CACHE_VERSION = 1
+RECENT_DAYS = 21                 # files newer than this are re-parsed every refresh;
+#                                  older ones are read once and served from cache.
 CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight burn
-PEAK_FLOOR = 300_000             # floor for the auto-calibrated 100% baseline
 MONO = "Menlo"
-PRIMARY = "#1d1d1f,#f5f5f7"      # adaptive (light,dark) high-contrast body text
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
 
@@ -154,10 +155,17 @@ def new_tokens():
 
 
 def add_tokens(dst, u):
+    """Add a raw usage object (input_tokens/...) into a token dict."""
     dst["input"] += u.get("input_tokens", 0) or 0
     dst["output"] += u.get("output_tokens", 0) or 0
     dst["cache_creation"] += u.get("cache_creation_input_tokens", 0) or 0
     dst["cache_read"] += u.get("cache_read_input_tokens", 0) or 0
+
+
+def merge(dst, src):
+    """Add one token dict (input/output/...) into another."""
+    for k in dst:
+        dst[k] += src.get(k, 0) or 0
 
 
 def weighted(t):
@@ -176,19 +184,24 @@ def raw_total(t):
     return t["input"] + t["output"] + t["cache_creation"] + t["cache_read"]
 
 
-def load_state():
+def load_cache():
     try:
-        with open(STATE_PATH) as f:
-            return json.load(f)
+        with open(CACHE_PATH) as f:
+            c = json.load(f)
+        if c.get("version") == CACHE_VERSION:
+            return c
     except Exception:
-        return {"peak": 0}
+        pass
+    return {"version": CACHE_VERSION, "files": {}, "peak": None}
 
 
-def save_state(state):
+def save_cache(cache):
     try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        with open(STATE_PATH, "w") as f:
-            json.dump(state, f)
+        os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, CACHE_PATH)
     except Exception:
         pass
 
@@ -261,43 +274,128 @@ def sep(sub=0):
 
 
 # ─────────────────────────── data load ───────────────────────────
-def load_records():
+def parse_file(fp, project, session, tz):
+    """Parse one transcript -> (json-serializable aggregate, [records])."""
+    all_t, msgs, sess_t = new_tokens(), 0, new_tokens()
+    by_model, by_day, by_hour = {}, {}, [0.0] * 24
+    sess_last = None
+    records = []
     seen = set()
-    out = []
+    try:
+        f = open(fp)
+    except Exception:
+        return None, []
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "assistant":
+                continue
+            msg = o.get("message") or {}
+            u, ts = msg.get("usage"), o.get("timestamp")
+            if not u or not ts:
+                continue
+            key = (msg.get("id"), o.get("requestId"))
+            if key != (None, None):
+                if key in seen:
+                    continue
+                seen.add(key)
+            try:
+                tsd = parse_ts(ts)
+            except Exception:
+                continue
+            model = msg.get("model", "?")
+            add_tokens(all_t, u); msgs += 1
+            add_tokens(by_model.setdefault(model, new_tokens()), u)
+            add_tokens(sess_t, u)
+            if sess_last is None or ts > sess_last:
+                sess_last = ts
+            lts = tsd.astimezone(tz)
+            d, hr = lts.date().isoformat(), lts.hour
+            wt = weighted_one(u)
+            dd = by_day.setdefault(d, [0.0, 0]); dd[0] += wt; dd[1] += 1
+            by_hour[hr] += wt
+            records.append({"ts": tsd, "model": model, "u": u,
+                            "project": project, "session": session})
+    agg = {"all": all_t, "msgs": msgs, "by_model": by_model, "by_day": by_day,
+           "by_hour": by_hour, "project": project, "session": session,
+           "sess_last": sess_last}
+    return agg, records
+
+
+def gather(now, tz):
+    """Aggregate all usage, parsing only new/changed/recent files (cache the rest).
+
+    Returns merged history aggregates + recent records (for blocks) + all-time
+    peak block. Per-file rollups are cached so each refresh stays cheap no matter
+    how large the transcript history grows."""
+    cutoff = now - timedelta(days=RECENT_DAYS)
+    cache = load_cache()
+    old_files = cache.get("files", {})
+    new_files = {}
+
+    all_t, all_msgs = new_tokens(), 0
+    by_model_all, by_project, by_session, by_day = {}, {}, {}, {}
+    hour_profile = [0.0] * 24
+    recent_records, parsed_records = [], []
+
     for fp in glob.glob(PROJECTS_GLOB, recursive=True):
         project = pretty_project(os.path.basename(os.path.dirname(fp)))
         session = os.path.splitext(os.path.basename(fp))[0]
         try:
-            f = open(fp)
-        except Exception:
+            st = os.stat(fp)
+        except OSError:
             continue
-        with f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    o = json.loads(line)
-                except Exception:
-                    continue
-                if o.get("type") != "assistant":
-                    continue
-                msg = o.get("message") or {}
-                u = msg.get("usage")
-                ts = o.get("timestamp")
-                if not u or not ts:
-                    continue
-                key = (msg.get("id"), o.get("requestId"))
-                if key != (None, None) and key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    out.append({"ts": parse_ts(ts), "model": msg.get("model", "?"),
-                                "u": u, "project": project, "session": session})
-                except Exception:
-                    continue
-    out.sort(key=lambda r: r["ts"])
-    return out
+        mtime, size = st.st_mtime, st.st_size
+        recent = mtime >= cutoff.timestamp()
+        cached = old_files.get(fp)
+        if recent or not cached or cached.get("mtime") != mtime \
+                or cached.get("size") != size:
+            agg, records = parse_file(fp, project, session, tz)
+            if agg is None:
+                continue
+            parsed_records.extend(records)
+            if recent:
+                recent_records.extend(records)
+            new_files[fp] = {"mtime": mtime, "size": size, "agg": agg}
+        else:
+            agg = cached["agg"]
+            new_files[fp] = cached
+
+        merge(all_t, agg["all"]); all_msgs += agg["msgs"]
+        for m, mt in agg["by_model"].items():
+            merge(by_model_all.setdefault(m, new_tokens()), mt)
+        for d, (w, c) in agg["by_day"].items():
+            dd = by_day.setdefault(d, [0.0, 0]); dd[0] += w; dd[1] += c
+        for i, v in enumerate(agg["by_hour"]):
+            hour_profile[i] += v
+        proj = by_project.setdefault(agg["project"],
+                                     {"t": new_tokens(), "m": 0, "s": set()})
+        merge(proj["t"], agg["all"]); proj["m"] += agg["msgs"]
+        proj["s"].add(agg["session"])
+        by_session[agg["session"]] = {"t": agg["all"], "m": agg["msgs"],
+                                      "p": agg["project"], "last": agg["sess_last"]}
+
+    # All-time peak block: high-water in cache, refreshed from whatever we parsed.
+    peak = cache.get("peak")
+    if parsed_records:
+        for b in build_blocks(sorted(parsed_records, key=lambda r: r["ts"])):
+            w = weighted(b["tokens"])
+            if not peak or w > peak["w"]:
+                peak = {"w": w, "start": b["start"].isoformat(), "msgs": b["msgs"]}
+
+    save_cache({"version": CACHE_VERSION, "files": new_files, "peak": peak})
+    return {
+        "all_tok": all_t, "all_msgs": all_msgs, "by_model": by_model_all,
+        "by_project": by_project, "by_session": by_session, "by_day": by_day,
+        "hour_profile": hour_profile, "recent_records": recent_records,
+        "peak": peak,
+    }
 
 
 def build_blocks(records):
@@ -405,10 +503,11 @@ def main():
     today = datetime.now().astimezone(tz).date()
     window = timedelta(hours=BLOCK_HOURS)
 
-    records = load_records()
     usage = load_usage()
+    data = gather(now, tz)          # incremental, cached — see gather()
+    all_msgs = data["all_msgs"]
 
-    if not records:
+    if all_msgs == 0:
         if usage:
             f5 = usage["rate_limits"]["five_hour"]
             ap = min(100, max(0, round(f5.get("used_percentage") or 0)))
@@ -424,50 +523,32 @@ def main():
         settings_menu(cfg)
         return
 
-    blocks = build_blocks(records)
+    all_tok = data["all_tok"]
+    by_model_all, by_project = data["by_model"], data["by_project"]
+    by_session, hour_profile = data["by_session"], data["hour_profile"]
+    by_day = {date.fromisoformat(k): v for k, v in data["by_day"].items()}
+    peak = data["peak"]
 
-    # ── aggregations ──
-    all_tok, all_msgs = new_tokens(), len(records)
-    by_model_all, by_project, by_session = {}, {}, {}
-    by_day = {}
-    hour_profile = [0.0] * 24
+    blocks = build_blocks(sorted(data["recent_records"], key=lambda r: r["ts"]))
+
+    # ── today / week / month from recent records + by-day rollup ──
+    month, week_start = today.replace(day=1), today - timedelta(days=6)
+    week_w = sum(v[0] for d, v in by_day.items() if d >= week_start)
+    month_w = sum(v[0] for d, v in by_day.items() if d >= month)
     today_tok, today_msgs, today_models = new_tokens(), 0, {}
-    today_hours = [0.0] * 24
-    today_sessions = set()
-    month = today.replace(day=1)
-    month_w = week_w = 0.0
-    week_start = today - timedelta(days=6)
-
-    for r in records:
-        u, ts = r["u"], r["ts"]
-        lts = ts.astimezone(tz)
-        d, hr = lts.date(), lts.hour
-        add_tokens(all_tok, u)
-        add_tokens(by_model_all.setdefault(r["model"], new_tokens()), u)
-        proj = by_project.setdefault(r["project"],
-                                     {"t": new_tokens(), "m": 0, "s": set()})
-        add_tokens(proj["t"], u); proj["m"] += 1; proj["s"].add(r["session"])
-        ssn = by_session.setdefault(r["session"],
-                                    {"t": new_tokens(), "m": 0, "p": r["project"],
-                                     "last": ts})
-        add_tokens(ssn["t"], u); ssn["m"] += 1; ssn["last"] = max(ssn["last"], ts)
-        wt = weighted_one(u)
-        agg = by_day.setdefault(d, [0.0, 0]); agg[0] += wt; agg[1] += 1
-        hour_profile[hr] += wt
-        if d == today:
-            add_tokens(today_tok, u); today_msgs += 1
-            add_tokens(today_models.setdefault(r["model"], new_tokens()), u)
-            today_hours[hr] += wt; today_sessions.add(r["session"])
-        if d >= month:
-            month_w += wt
-        if d >= week_start:
-            week_w += wt
+    today_hours, today_sessions = [0.0] * 24, set()
+    for r in data["recent_records"]:
+        lts = r["ts"].astimezone(tz)
+        if lts.date() == today:
+            add_tokens(today_tok, r["u"]); today_msgs += 1
+            add_tokens(today_models.setdefault(r["model"], new_tokens()), r["u"])
+            today_hours[lts.hour] += weighted_one(r["u"])
+            today_sessions.add(r["session"])
 
     # ── derived (history only; live limits come from Anthropic) ──
-    last = blocks[-1]
-    active = last if now - last["start"] < window else None
-    peak_block = max(blocks, key=lambda b: weighted(b["tokens"]))
-    busiest_day = max(by_day.items(), key=lambda kv: kv[1][0])
+    last = blocks[-1] if blocks else None
+    active = last if (last and now - last["start"] < window) else None
+    busiest_day = max(by_day.items(), key=lambda kv: kv[1][0]) if by_day else (today, [0.0, 0])
 
     # ════════════════ MENU BAR TITLE ════════════════
     # The REAL 5-hour % from Anthropic (live, cross-surface). The optional trailer
@@ -524,14 +605,14 @@ def main():
         emit(f"All-time     {compact(weighted(all_tok)):>8} tok", sub=1)
         emit(f"Messages     {all_msgs:>8}", sub=1)
         emit(f"Sessions     {len(by_session):>8}", sub=1)
-        emit(f"Peak block   {compact(weighted(peak_block['tokens'])):>8} tok", sub=1)
+        emit(f"Peak block   {compact(peak['w']) if peak else '-':>8} tok", sub=1)
         bd, (bw, _bm) = busiest_day
         emit(f"Busiest day  {compact(bw):>8} tok", sub=1)
         sep()
     else:
         emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
-                           hour_profile, all_tok, all_msgs, records, today, tz,
-                           week_w, month_w, peak_block, busiest_day, active, now)
+                           hour_profile, all_tok, all_msgs, today, tz,
+                           week_w, month_w, peak, busiest_day, active, now)
 
     settings_menu(cfg)
     sep()
@@ -541,8 +622,8 @@ def main():
 
 
 def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
-                       hour_profile, all_tok, all_msgs, records, today, tz,
-                       week_w, month_w, peak_block, busiest_day, active, now):
+                       hour_profile, all_tok, all_msgs, today, tz,
+                       week_w, month_w, peak, busiest_day, active, now):
     # LAST 7 DAYS
     emit("LAST 7 DAYS", color=MUTED, sfimage="chart.bar.fill", header=True)
     days = sorted(by_day.items(), reverse=True)[:7]
@@ -556,8 +637,8 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     sep()
 
     # ALL TIME
-    first = records[0]["ts"].astimezone(tz)
-    span_days = (today - first.date()).days + 1
+    first_day = min(by_day) if by_day else today
+    span_days = (today - first_day).days + 1
     emit("ALL TIME", color=MUTED, sfimage="clock.arrow.circlepath", header=True)
     if PLAN:
         emit(f"Plan        {PLAN_LABEL[PLAN]:>8}")
@@ -566,7 +647,7 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     emit(f"Messages    {all_msgs:>8}")
     emit(f"Sessions    {len(by_session):>8}")
     emit(f"Projects    {len(by_project):>8}")
-    emit(f"Since       {first.strftime('%Y-%m-%d')} ({span_days}d)")
+    emit(f"Since       {first_day.strftime('%Y-%m-%d')} ({span_days}d)")
     emit(f"Daily avg   {compact(weighted(all_tok)/max(1,span_days)):>8} tok")
     emit(f"By hour  {spark(hour_profile)}")
     emit("By model")
@@ -578,16 +659,18 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     emit("Top sessions")
     for _sid, sv in sorted(by_session.items(),
                            key=lambda kv: -weighted(kv[1]["t"]))[:8]:
-        when = sv["last"].astimezone(tz).strftime("%m-%d")
+        when = (datetime.fromisoformat(sv["last"]).astimezone(tz).strftime("%m-%d")
+                if sv.get("last") else "  -  ")
         emit(f"{sv['p'][:12]:<12} {when} {compact(weighted(sv['t'])):>7} "
              f"{sv['m']:>4}m", sub=1)
     sep()
 
     # RECORDS
     emit("RECORDS", color=MUTED, sfimage="trophy.fill", header=True)
-    pb_when = peak_block["start"].astimezone(tz).strftime("%Y-%m-%d %H:%M")
-    emit(f"Peak block  {compact(weighted(peak_block['tokens'])):>8} tok")
-    emit(f"            {pb_when}", color=MUTED)
+    if peak:
+        pb_when = datetime.fromisoformat(peak["start"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        emit(f"Peak block  {compact(peak['w']):>8} tok")
+        emit(f"            {pb_when}", color=MUTED)
     bd, (bw, bm) = busiest_day
     emit(f"Busiest day {compact(bw):>8} tok")
     emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED)
