@@ -42,7 +42,33 @@ OSA
   echo "  SwiftBar set to launch at login."
 fi
 
-# 5. Launch / refresh.
+# 5. Live usage bridge — real 5h/7d limits + reset times, captured from Claude
+#    Code's statusLine (the same data the /usage command shows).
+BRIDGE="$HERE/burnbar-statusline.py"
+chmod +x "$BRIDGE"
+read -r -p "Enable live usage (real limits + reset times via Claude Code statusLine)? [Y/n] " yn
+if [[ ! "$yn" =~ ^[Nn]$ ]]; then
+  python3 - "$BRIDGE" <<'PY'
+import json, os, sys
+bridge = sys.argv[1]
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+ex = d.get("statusLine")
+if isinstance(ex, dict) and ex.get("command") and ex.get("command") != bridge:
+    print("  NOTE: you already have a statusLine configured — not overwriting it.")
+    print("        To still capture live usage, have that command also append the")
+    print("        rate_limits from its stdin to ~/.config/burnbar/usage.json (see README).")
+else:
+    d["statusLine"] = {"type": "command", "command": bridge, "padding": 0}
+    json.dump(d, open(p, "w"), indent=2)
+    print("  Live usage enabled. It populates on your next Claude Code message.")
+PY
+fi
+
+# 6. Launch / refresh.
 open -a SwiftBar
 open "swiftbar://refreshallplugins" >/dev/null 2>&1 || true
 echo "Done. Look for the burnbar bar in your menu bar; click it for stats + ⚙ Settings."

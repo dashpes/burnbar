@@ -23,6 +23,41 @@ headers:
 - **Records** — peak block ever, busiest day, the calibrated 100% baseline
 - **Recent blocks** — the last 10 rolling windows, live one highlighted
 
+## Live usage (real limits, not estimates)
+
+By default the bar is a token-based *estimate* from local transcripts. But
+burnbar can also show your **real** usage limits — the same numbers the `/usage`
+command shows — pulled straight from Anthropic:
+
+- **5-hour**, **7-day**, and **Opus** limits as exact `used_percentage`
+- **Exact reset times** (`resets_at`)
+- **Cross-surface**: Anthropic computes these server-side, so they already
+  include claude.ai web, Claude Code, and every machine you use
+
+Claude Code only exposes this via its **statusLine** (a command it feeds a JSON
+blob on each UI update). `burnbar-statusline.py` captures that `rate_limits`
+object to `~/.config/burnbar/usage.json` and prints a compact status line back:
+
+```
+5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
+```
+
+`install.sh` offers to wire this for you. Manual setup — add to
+`~/.claude/settings.json`:
+
+```json
+"statusLine": { "type": "command", "command": "/abs/path/to/burnbar-statusline.py", "padding": 0 }
+```
+
+When live data is present, the menu bar bar shows your true 5-hour `%` and the
+dropdown gains a **USAGE LIMITS · live** section. It updates whenever you use
+Claude Code on this Mac (the values are global, so it stays accurate); when idle
+it shows the last-known reading with an "as of" time. No live data? burnbar
+falls back to the auto-calibrated token estimate below.
+
+> Everything stays on your machine — the bridge only writes a local file. No
+> network calls, no token handling (Claude Code already holds the OAuth token).
+
 ## How it works
 
 - Reads `~/.claude/projects/**/*.jsonl` (Claude Code's local session transcripts).
