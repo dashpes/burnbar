@@ -26,7 +26,10 @@ from datetime import datetime, timedelta, timezone
 
 # ─────────────────────────── config ───────────────────────────
 BLOCK_HOURS = 5
-BAR_CELLS = 10
+BAR_CELLS = 10                   # bar width inside the dropdown
+MENUBAR_CELLS = 5                # bar width in the menu bar itself (smaller)
+TITLE_SIZE = 11                  # font size of the menu-bar title
+SHOW_MENUBAR_TOKENS = False      # also show compact token count next to the %
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 STATE_PATH = os.path.expanduser("~/.config/burnbar/state.json")
 CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight burn
@@ -34,6 +37,7 @@ PEAK_FLOOR = 300_000             # floor for the auto-calibrated 100% baseline
 MONO = "Menlo"
 FONT = f"font={MONO} size=13"
 HEADER_FONT = f"font={MONO} size=12"
+TITLE_FONT = f"font={MONO} size={TITLE_SIZE}"
 
 # ─────────────────────────── helpers ───────────────────────────
 def parse_ts(s):
@@ -299,14 +303,18 @@ def main():
     # ── active block + peak calibration ──
     last = blocks[-1]
     active = last if now - last["start"] < window else None
-    completed = [b for b in blocks if b is not active]
-    completed_w = [weighted(b["tokens"]) for b in completed]
-    peak = max(completed_w + [state.get("peak", 0), PEAK_FLOOR])
+    all_w = [weighted(b["tokens"]) for b in blocks]
+    completed_w = [weighted(b["tokens"]) for b in blocks if b is not active]
+    # Persisted high-water mark only folds in COMPLETED blocks, so a still-
+    # growing active block isn't locked in until it's done.
     if completed_w:
         np = max(state.get("peak", 0), max(completed_w))
         if np != state.get("peak", 0):
             state["peak"] = np
             save_state(state)
+    # Denominator INCLUDES the active block, so the bar can never exceed 100%:
+    # 100% means "burning as hard as you ever have".
+    peak = max(all_w + [state.get("peak", 0), PEAK_FLOOR])
 
     # ── records / peaks ──
     peak_block = max(blocks, key=lambda b: weighted(b["tokens"]))
@@ -314,13 +322,14 @@ def main():
 
     # ════════════════ MENU BAR TITLE ════════════════
     if active is None:
-        print(f"{render_bar(0)} idle | {FONT} color=#8e8e93")
+        print(f"{render_bar(0, MENUBAR_CELLS)} idle | {TITLE_FONT} color=#8e8e93")
     else:
         burn = weighted(active["tokens"])
-        frac = burn / peak if peak else 0
-        pct = round(frac * 100)
-        print(f"{render_bar(frac)} {pct}% · {compact(burn)} | "
-              f"{FONT} color={color_for(pct)}")
+        frac = min(1.0, burn / peak) if peak else 0
+        pct = min(100, round(frac * 100))
+        extra = f" · {compact(burn)}" if SHOW_MENUBAR_TOKENS else ""
+        print(f"{render_bar(frac, MENUBAR_CELLS)} {pct}%{extra} | "
+              f"{TITLE_FONT} color={color_for(pct)}")
     sep()
 
     # ════════════════ CURRENT BLOCK ════════════════
@@ -330,7 +339,7 @@ def main():
              color="#8e8e93")
     else:
         burn = weighted(active["tokens"])
-        pct = round(burn / peak * 100) if peak else 0
+        pct = min(100, round(burn / peak * 100)) if peak else 0
         end = active["start"] + window
         elapsed = now - active["start"]
         elapsed_min = max(1.0, elapsed.total_seconds() / 60)
