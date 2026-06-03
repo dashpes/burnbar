@@ -276,7 +276,7 @@ def sep(sub=0):
 # ─────────────────────────── data load ───────────────────────────
 def parse_file(fp, project, session, tz):
     """Parse one transcript -> (json-serializable aggregate, [records])."""
-    all_t, msgs, sess_t = new_tokens(), 0, new_tokens()
+    all_t, msgs = new_tokens(), 0
     by_model, by_day, by_hour = {}, {}, [0.0] * 24
     sess_last = None
     records = []
@@ -312,7 +312,6 @@ def parse_file(fp, project, session, tz):
             model = msg.get("model", "?")
             add_tokens(all_t, u); msgs += 1
             add_tokens(by_model.setdefault(model, new_tokens()), u)
-            add_tokens(sess_t, u)
             if sess_last is None or ts > sess_last:
                 sess_last = ts
             lts = tsd.astimezone(tz)
@@ -343,6 +342,7 @@ def gather(now, tz):
     by_model_all, by_project, by_session, by_day = {}, {}, {}, {}
     hour_profile = [0.0] * 24
     recent_records, parsed_records = [], []
+    dirty = False
 
     for fp in glob.glob(PROJECTS_GLOB, recursive=True):
         project = pretty_project(os.path.basename(os.path.dirname(fp)))
@@ -354,8 +354,9 @@ def gather(now, tz):
         mtime, size = st.st_mtime, st.st_size
         recent = mtime >= cutoff.timestamp()
         cached = old_files.get(fp)
-        if recent or not cached or cached.get("mtime") != mtime \
-                or cached.get("size") != size:
+        changed = (not cached or cached.get("mtime") != mtime
+                   or cached.get("size") != size)
+        if recent or changed:
             agg, records = parse_file(fp, project, session, tz)
             if agg is None:
                 continue
@@ -363,6 +364,7 @@ def gather(now, tz):
             if recent:
                 recent_records.extend(records)
             new_files[fp] = {"mtime": mtime, "size": size, "agg": agg}
+            dirty = dirty or changed
         else:
             agg = cached["agg"]
             new_files[fp] = cached
@@ -389,7 +391,10 @@ def gather(now, tz):
             if not peak or w > peak["w"]:
                 peak = {"w": w, "start": b["start"].isoformat(), "msgs": b["msgs"]}
 
-    save_cache({"version": CACHE_VERSION, "files": new_files, "peak": peak})
+    # Only rewrite the cache when something actually changed (new/changed/pruned
+    # file, or a new peak) — avoids a disk write on every idle refresh.
+    if dirty or peak != cache.get("peak") or set(new_files) != set(old_files):
+        save_cache({"version": CACHE_VERSION, "files": new_files, "peak": peak})
     return {
         "all_tok": all_t, "all_msgs": all_msgs, "by_model": by_model_all,
         "by_project": by_project, "by_session": by_session, "by_day": by_day,
@@ -659,7 +664,7 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     emit("Top sessions")
     for _sid, sv in sorted(by_session.items(),
                            key=lambda kv: -weighted(kv[1]["t"]))[:8]:
-        when = (datetime.fromisoformat(sv["last"]).astimezone(tz).strftime("%m-%d")
+        when = (parse_ts(sv["last"]).astimezone(tz).strftime("%m-%d")
                 if sv.get("last") else "  -  ")
         emit(f"{sv['p'][:12]:<12} {when} {compact(weighted(sv['t'])):>7} "
              f"{sv['m']:>4}m", sub=1)
@@ -668,7 +673,7 @@ def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
     # RECORDS
     emit("RECORDS", color=MUTED, sfimage="trophy.fill", header=True)
     if peak:
-        pb_when = datetime.fromisoformat(peak["start"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        pb_when = parse_ts(peak["start"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
         emit(f"Peak block  {compact(peak['w']):>8} tok")
         emit(f"            {pb_when}", color=MUTED)
     bd, (bw, bm) = busiest_day
