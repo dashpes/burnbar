@@ -52,7 +52,17 @@ else
   mkdir -p "$SRC"
   echo "Fetching burnbar into $SRC ..."
   for f in burnbar.30s.py burnbar-statusline.py; do
-    curl -fsSL "$RAW/$f" -o "$SRC/$f"
+    # Download to a temp file and make sure it at least parses as Python before
+    # swapping it in — a truncated or failed fetch must never clobber a working
+    # install. The mv is atomic, so the live symlink target is never half-written.
+    tmp="$SRC/.$f.tmp"
+    curl -fsSL "$RAW/$f" -o "$tmp"
+    if ! python3 -m py_compile "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      echo "burnbar: download of $f failed to validate — aborting; existing install left untouched." >&2
+      exit 1
+    fi
+    mv -f "$tmp" "$SRC/$f"
   done
 fi
 PLUGIN="$SRC/burnbar.30s.py"

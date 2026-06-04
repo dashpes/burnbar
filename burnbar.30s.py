@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.6.0</bitbar.version>
+# <bitbar.version>1.0.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -22,12 +22,15 @@ Settings are stored in ~/.config/burnbar/config.json and changed by clicking
 items in the Settings submenu (which re-invoke this script with --set).
 """
 
+import base64
 import glob
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
+import zlib
 from datetime import date, datetime, timedelta, timezone
 
 # ─────────────────────────── fixed config ───────────────────────────
@@ -43,6 +46,11 @@ CACHE_VERSION = 5                # bumped: per-file aggregates now carry context
 UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
 RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
     "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
+# Releases API, derived from RAW_BASE so a fork only has to override one var.
+_OWNER_REPO = re.search(r"githubusercontent\.com/([^/]+)/([^/]+)/", RAW_BASE)
+API_BASE = ("https://api.github.com/repos/"
+            f"{_OWNER_REPO.group(1)}/{_OWNER_REPO.group(2)}"
+            if _OWNER_REPO else "https://api.github.com/repos/dashpes/burnbar")
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -52,7 +60,8 @@ CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight bur
 # ── context window (how much of the model's window each agent has filled) ──
 CTX_200K = 200_000               # standard Claude Code window
 CTX_1M = 1_000_000               # the 1M-context Opus
-CONTEXT_ACTIVE_MIN = 120         # a main session counts as "active" if touched this recently
+CONTEXT_ACTIVE_MIN = 10          # fallback only (live processes unreadable): treat a session
+                                 # touched this recently as still open
 CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still running
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
 CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
@@ -117,6 +126,38 @@ THEMES = {
 # Module-level theme/derived colors; set in main() once config is loaded.
 TH = THEMES["default"]
 MUTED = TH["muted"]
+
+
+# ── theme swatches: SwiftBar can't render multi-color text (ANSI is 16-color and
+#    mangles truecolor), so to preview a theme's gradient in the picker we draw a
+#    tiny PNG of its colour stops and hand it to the item as a base64 `image=`.
+#    Pure stdlib (zlib + struct) — no Pillow, keeps burnbar dependency-free.
+def _png(width, height, pixels):
+    """Encode raw RGB bytes (width*height*3) as a minimal 8-bit truecolor PNG."""
+    raw = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw.append(0)                       # filter type 0 (none) per scanline
+        raw += pixels[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def theme_swatch(grad, seg=11, height=12):
+    """A base64 PNG of a theme's gradient: one solid block per colour stop — which
+    mirrors how the burn bar actually picks a single stop by severity, not a blend."""
+    stops = [(int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)) for c in grad]
+    width = seg * len(stops)
+    row = bytearray()
+    for x in range(width):
+        row += bytes(stops[min(x // seg, len(stops) - 1)])
+    return base64.b64encode(_png(width, height, bytes(row) * height)).decode()
 
 
 # ─────────────────────────── config i/o ───────────────────────────
@@ -325,19 +366,34 @@ def version_tuple(s):
 
 
 def fetch_latest_version():
-    """Read just the header of the published plugin and return its <bitbar.version>,
-    or None on any failure. This is the only network call burnbar makes — a plain
-    version GET to GitHub; no usage data ever leaves the machine."""
+    """Latest *published* version, or None on any failure. Prefer the newest GitHub
+    Release tag, so users are only nudged toward released builds — not a transient
+    version bump that's landed on the default branch but isn't out yet. Fall back to
+    the plugin's <bitbar.version> header on the default branch if the releases API
+    can't be reached or no release exists yet. This is the only network call burnbar
+    makes — a plain version GET to GitHub; no usage data ever leaves the machine."""
     import urllib.request
+    # 1. Newest release tag (vX.Y.Z -> X.Y.Z).
+    try:
+        req = urllib.request.Request(
+            f"{API_BASE}/releases/latest",
+            headers={"User-Agent": "burnbar",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            tag = (json.load(r).get("tag_name") or "").lstrip("v")
+        if tag:
+            return tag
+    except Exception:
+        pass
+    # 2. Fall back to the header on the default branch.
     try:
         req = urllib.request.Request(
             f"{RAW_BASE}/burnbar.30s.py",
             headers={"Range": "bytes=0-2047", "User-Agent": "burnbar"})
         with urllib.request.urlopen(req, timeout=3) as r:
-            head = r.read(2048).decode("utf-8", "replace")
+            return parse_version_header(r.read(2048).decode("utf-8", "replace"))
     except Exception:
         return None
-    return parse_version_header(head)
 
 
 def check_update(cfg, now_epoch):
@@ -409,10 +465,13 @@ def pretty_project(dirname):
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
 def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
-         action=None, args=None, open_path=None, header=False, terminal=False):
+         action=None, args=None, open_path=None, header=False, terminal=False,
+         image=None):
     prefix = "--" * sub
     params = [f"font={MONO} size={12 if header else size}"]
     params.append(f"color={color if color is not None else TH['text']}")
+    if image:
+        params.append(f"image={image}")
     if sfimage:
         params.append(f"sfimage={sfimage}")
     if refresh:
@@ -737,32 +796,65 @@ def ctx_row(sv, now_ts, mode, agent=False):
 
 
 def live_session_cwds():
-    """Working dirs that have a live Claude Code CLI session, with a count of how
-    many — found by inspecting running `claude` processes (their cwd is the only
-    reliable 'this session is open' signal; the transcript isn't held open and
-    carries no pid). Returns {cwd: count}, {} if none are running, or None if we
-    couldn't look (so the caller can fall back to a time-based guess)."""
+    """How many Claude Code CLI sessions are open, and in which working dirs.
+
+    A running `claude` process is the only reliable 'this session is open' signal
+    (the transcript isn't held open and carries no pid); its cwd is the only clue
+    to *which* session. Returns a (total, by_dir) pair so the caller can degrade
+    gracefully rather than fall straight back to a wide time-based guess:
+      (0, {})         nothing running
+      (n, {cwd: k})   n sessions, located by dir — the precise, common case
+      (n, None)       n sessions exist but we couldn't read their dirs (lsof blocked)
+      (None, None)    couldn't even count processes
+    """
     try:
         pids = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
-                              capture_output=True, text=True, timeout=2).stdout.split()
+                              capture_output=True, text=True, timeout=3).stdout.split()
     except Exception:
-        return None
+        return None, None
     if not pids:
-        return {}
+        return 0, {}
     try:
         # One lsof for all pids (it's the slow call): each process emits its cwd
         # as an `n` line, so counting those tallies live sessions per dir.
         out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn",
                               "-p", ",".join(pids)],
-                             capture_output=True, text=True, timeout=4).stdout
+                             capture_output=True, text=True, timeout=6).stdout
     except Exception:
-        return None
+        return len(pids), None
     counts = {}
     for line in out.splitlines():
         if line.startswith("n"):
             cwd = os.path.normpath(line[1:])
             counts[cwd] = counts.get(cwd, 0) + 1
-    return counts
+    # lsof ran but surfaced no cwds (sandboxed / raced): still report the count.
+    if not counts:
+        return len(pids), None
+    return len(pids), counts
+
+
+def select_live_mains(cand, live_n, by_dir, now_ts):
+    """Pick which main sessions to show as live, degrading by how much the process
+    probe could tell us (see live_session_cwds for the (live_n, by_dir) shape):
+      - by_dir known: per working dir, the N most-recently-active sessions where N
+        is the live-process count there, so closed sessions can't linger ({} -> none);
+      - by_dir None but live_n known: that many most-recent sessions, recency-gated;
+      - both unknown: a short recency window only.
+    `cand` is [(key, sv), ...] pre-sorted newest-first; returns the kept sublist."""
+    def norm(sv):
+        return os.path.normpath(sv.get("cwd") or "")
+    if by_dir is not None:
+        budget = dict(by_dir)
+        mains = []
+        for k, v in cand:
+            c = norm(v)
+            if budget.get(c, 0) > 0:
+                mains.append((k, v))
+                budget[c] -= 1
+        return mains
+    cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+    mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
+    return mains[:live_n] if live_n else mains
 
 
 def emit_context(by_session, now, cfg):
@@ -799,26 +891,12 @@ def emit_context(by_session, now, cfg):
     if not cand and not agent_cand:
         return
 
-    proc = live_session_cwds()
+    live_n, by_dir = live_session_cwds()
+    mains = select_live_mains(cand, live_n, by_dir, now_ts)
 
-    # Main sessions: prefer the precise process signal — for each working dir show
-    # the N most-recently-active sessions where N = live `claude` processes there,
-    # so closed sessions can't linger. If we can't read processes, fall back to a
-    # recency window.
-    if proc is None:
-        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
-        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
-    else:
-        budget = dict(proc)
-        mains = []
-        for k, v in cand:
-            c = norm(v)
-            if budget.get(c, 0) > 0:
-                mains.append((k, v))
-                budget[c] -= 1
-
-    # Subagents: still-running ones (parent hasn't resumed) in a live working dir.
-    agents = [kv for kv in agent_cand if proc is None or norm(kv[1]) in proc]
+    # Subagents: still-running ones (parent hasn't resumed) in a live working dir
+    # (or, when we can't see dirs, just the still-running ones).
+    agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
     if not mains and not agents:
         return
     by_parent = {}
@@ -1061,7 +1139,10 @@ def settings_menu(cfg):
     emit("Settings", color=MUTED, sfimage="gearshape", header=True)
 
     def mark(active):
-        return "[x] " if active else "[ ] "
+        # A checkmark on the selected row, blank (aligned) on the rest — cleaner
+        # than [x]/[ ] boxes. A native menu can't persistently highlight a row's
+        # background, so the checkmark is the selection cue.
+        return "✓ " if active else "  "
 
     emit("View")
     emit(f"{mark(cfg['view']=='compact')}Compact", sub=1, action=SELF,
@@ -1071,7 +1152,11 @@ def settings_menu(cfg):
 
     emit("Theme")
     for name in THEMES:
-        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1, action=SELF,
+        # Preview each theme by a PNG swatch of its gradient stops — the thing that
+        # actually differs between themes (their font colors are all near-white/black
+        # for readability, so they can't tell the themes apart on their own).
+        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1,
+             image=theme_swatch(THEMES[name]["grad"]), action=SELF,
              args=["--set", f"theme={name}"], refresh=True)
 
     emit("Menu-bar trailer")

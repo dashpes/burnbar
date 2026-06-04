@@ -7,16 +7,38 @@ on:
     branches: [main]
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+      - name: Ruff (bug-focused rules, see ruff.toml)
+        run: |
+          pip install --quiet -r requirements-dev.txt
+          ruff check burnbar.30s.py burnbar-statusline.py
+
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the supported floor (oldest python3 burnbar targets); 3.x is the
+        # current release — running both catches code that needs a newer runtime.
+        python-version: ["3.9", "3.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Compile
         run: python3 -m py_compile burnbar.30s.py burnbar-statusline.py
+
+      - name: Tests
+        # Pure-logic unit tests (stdlib unittest, no deps); run on every matrix leg.
+        run: python3 -m unittest discover -s tests -v
 
       - name: Smoke run
         # No ~/.claude transcripts here, so the plugin takes its "set up" path;
@@ -32,9 +54,10 @@ jobs:
       - name: Version bump reminder
         # Non-blocking nudge: if the plugin changed in a PR but the version
         # didn't, flag it — the release only fires when the version is new.
-        if: github.event_name == 'pull_request'
+        # One matrix leg is enough; don't double-post the warning.
+        if: github.event_name == 'pull_request' && matrix.python-version == '3.x'
         run: |
-          ver() { grep -oE '<bitbar\.version>[^<]+' "$1" | sed 's/.*>//'; }
+          ver() { grep -m1 -oE '<bitbar\.version>[0-9.]+' "$1" | sed 's/.*>//'; }
           git fetch origin "${{ github.base_ref }}" --depth=1
           base=$(git show "origin/${{ github.base_ref }}:burnbar.30s.py" | ver /dev/stdin || echo "")
           head=$(ver burnbar.30s.py)

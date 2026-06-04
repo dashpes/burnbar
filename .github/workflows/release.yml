@@ -22,7 +22,15 @@ jobs:
       - name: Read version from header
         id: v
         run: |
-          ver=$(grep -oE '<bitbar\.version>[^<]+' burnbar.30s.py | sed 's/.*>//')
+          # Match only the real version header (digits/dots after the tag), and
+          # take the first hit — the file mentions <bitbar.version> in comments
+          # and docstrings too, which would otherwise make $ver multi-line and
+          # break the $GITHUB_OUTPUT write.
+          ver=$(grep -m1 -oE '<bitbar\.version>[0-9.]+' burnbar.30s.py | sed 's/.*>//')
+          if [ -z "$ver" ]; then
+            echo "::error::Could not parse <bitbar.version> from burnbar.30s.py"
+            exit 1
+          fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "Version on main: $ver"
 

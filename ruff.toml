@@ -1,0 +1,9 @@
+# Lint for real bugs, not style. F = pyflakes (unused imports, undefined names,
+# f-string mistakes); E9 = syntax errors. The plugin deliberately uses semicolon
+# one-liners in its compact rendering code, so the pycodestyle statement-style
+# rules (E7) are intentionally left out — they'd fight the house style, not catch
+# bugs.
+target-version = "py39"
+
+[lint]
+select = ["E9", "F"]
