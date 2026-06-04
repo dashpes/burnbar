@@ -34,7 +34,7 @@ jobs:
         # didn't, flag it — the release only fires when the version is new.
         if: github.event_name == 'pull_request'
         run: |
-          ver() { grep -oE '<bitbar\.version>[^<]+' "$1" | sed 's/.*>//'; }
+          ver() { grep -m1 -oE '<bitbar\.version>[0-9.]+' "$1" | sed 's/.*>//'; }
           git fetch origin "${{ github.base_ref }}" --depth=1
           base=$(git show "origin/${{ github.base_ref }}:burnbar.30s.py" | ver /dev/stdin || echo "")
           head=$(ver burnbar.30s.py)
