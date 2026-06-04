@@ -52,7 +52,8 @@ CACHE_READ_WEIGHT = 0.1          # cache reads are ~10x lighter; down-weight bur
 # ── context window (how much of the model's window each agent has filled) ──
 CTX_200K = 200_000               # standard Claude Code window
 CTX_1M = 1_000_000               # the 1M-context Opus
-CONTEXT_ACTIVE_MIN = 120         # a main session counts as "active" if touched this recently
+CONTEXT_ACTIVE_MIN = 10          # fallback only (live processes unreadable): treat a session
+                                 # touched this recently as still open
 CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still running
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
 CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
@@ -737,32 +738,41 @@ def ctx_row(sv, now_ts, mode, agent=False):
 
 
 def live_session_cwds():
-    """Working dirs that have a live Claude Code CLI session, with a count of how
-    many — found by inspecting running `claude` processes (their cwd is the only
-    reliable 'this session is open' signal; the transcript isn't held open and
-    carries no pid). Returns {cwd: count}, {} if none are running, or None if we
-    couldn't look (so the caller can fall back to a time-based guess)."""
+    """How many Claude Code CLI sessions are open, and in which working dirs.
+
+    A running `claude` process is the only reliable 'this session is open' signal
+    (the transcript isn't held open and carries no pid); its cwd is the only clue
+    to *which* session. Returns a (total, by_dir) pair so the caller can degrade
+    gracefully rather than fall straight back to a wide time-based guess:
+      (0, {})         nothing running
+      (n, {cwd: k})   n sessions, located by dir — the precise, common case
+      (n, None)       n sessions exist but we couldn't read their dirs (lsof blocked)
+      (None, None)    couldn't even count processes
+    """
     try:
         pids = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
-                              capture_output=True, text=True, timeout=2).stdout.split()
+                              capture_output=True, text=True, timeout=3).stdout.split()
     except Exception:
-        return None
+        return None, None
     if not pids:
-        return {}
+        return 0, {}
     try:
         # One lsof for all pids (it's the slow call): each process emits its cwd
         # as an `n` line, so counting those tallies live sessions per dir.
         out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn",
                               "-p", ",".join(pids)],
-                             capture_output=True, text=True, timeout=4).stdout
+                             capture_output=True, text=True, timeout=6).stdout
     except Exception:
-        return None
+        return len(pids), None
     counts = {}
     for line in out.splitlines():
         if line.startswith("n"):
             cwd = os.path.normpath(line[1:])
             counts[cwd] = counts.get(cwd, 0) + 1
-    return counts
+    # lsof ran but surfaced no cwds (sandboxed / raced): still report the count.
+    if not counts:
+        return len(pids), None
+    return len(pids), counts
 
 
 def emit_context(by_session, now, cfg):
@@ -799,26 +809,32 @@ def emit_context(by_session, now, cfg):
     if not cand and not agent_cand:
         return
 
-    proc = live_session_cwds()
+    live_n, by_dir = live_session_cwds()
 
     # Main sessions: prefer the precise process signal — for each working dir show
     # the N most-recently-active sessions where N = live `claude` processes there,
-    # so closed sessions can't linger. If we can't read processes, fall back to a
-    # recency window.
-    if proc is None:
-        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
-        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
-    else:
-        budget = dict(proc)
+    # so closed sessions can't linger. (by_dir == {} means processes were readable
+    # and none are running, which correctly yields no rows.)
+    if by_dir is not None:
+        budget = dict(by_dir)
         mains = []
         for k, v in cand:
             c = norm(v)
             if budget.get(c, 0) > 0:
                 mains.append((k, v))
                 budget[c] -= 1
+    else:
+        # We couldn't locate sessions by dir. Use a short recency window so a closed
+        # session lingers for minutes, not hours; if pgrep at least gave us a count,
+        # cap to it so we never show more rows than there are open sessions.
+        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
+        if live_n:
+            mains = mains[:live_n]
 
-    # Subagents: still-running ones (parent hasn't resumed) in a live working dir.
-    agents = [kv for kv in agent_cand if proc is None or norm(kv[1]) in proc]
+    # Subagents: still-running ones (parent hasn't resumed) in a live working dir
+    # (or, when we can't see dirs, just the still-running ones).
+    agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
     if not mains and not agents:
         return
     by_parent = {}
