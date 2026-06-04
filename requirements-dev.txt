@@ -1,0 +1,3 @@
+# Dev / CI tooling only — burnbar itself has no runtime dependencies (stdlib).
+# Pinned so a new ruff release can't turn CI red on code you didn't touch.
+ruff==0.15.15

@@ -16,7 +16,7 @@ jobs:
           python-version: "3.x"
       - name: Ruff (bug-focused rules, see ruff.toml)
         run: |
-          pip install --quiet ruff
+          pip install --quiet -r requirements-dev.txt
           ruff check burnbar.30s.py burnbar-statusline.py
 
   check:
@@ -35,6 +35,10 @@ jobs:
 
       - name: Compile
         run: python3 -m py_compile burnbar.30s.py burnbar-statusline.py
+
+      - name: Tests
+        # Pure-logic unit tests (stdlib unittest, no deps); run on every matrix leg.
+        run: python3 -m unittest discover -s tests -v
 
       - name: Smoke run
         # No ~/.claude transcripts here, so the plugin takes its "set up" path;
