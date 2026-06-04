@@ -1139,7 +1139,10 @@ def settings_menu(cfg):
     emit("Settings", color=MUTED, sfimage="gearshape", header=True)
 
     def mark(active):
-        return "[x] " if active else "[ ] "
+        # A checkmark on the selected row, blank (aligned) on the rest — cleaner
+        # than [x]/[ ] boxes. A native menu can't persistently highlight a row's
+        # background, so the checkmark is the selection cue.
+        return "✓ " if active else "  "
 
     emit("View")
     emit(f"{mark(cfg['view']=='compact')}Compact", sub=1, action=SELF,
