@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>0.6.0</bitbar.version>
+# <bitbar.version>1.0.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
