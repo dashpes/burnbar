@@ -795,6 +795,30 @@ def live_session_cwds():
     return len(pids), counts
 
 
+def select_live_mains(cand, live_n, by_dir, now_ts):
+    """Pick which main sessions to show as live, degrading by how much the process
+    probe could tell us (see live_session_cwds for the (live_n, by_dir) shape):
+      - by_dir known: per working dir, the N most-recently-active sessions where N
+        is the live-process count there, so closed sessions can't linger ({} -> none);
+      - by_dir None but live_n known: that many most-recent sessions, recency-gated;
+      - both unknown: a short recency window only.
+    `cand` is [(key, sv), ...] pre-sorted newest-first; returns the kept sublist."""
+    def norm(sv):
+        return os.path.normpath(sv.get("cwd") or "")
+    if by_dir is not None:
+        budget = dict(by_dir)
+        mains = []
+        for k, v in cand:
+            c = norm(v)
+            if budget.get(c, 0) > 0:
+                mains.append((k, v))
+                budget[c] -= 1
+        return mains
+    cut = now_ts - CONTEXT_ACTIVE_MIN * 60
+    mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
+    return mains[:live_n] if live_n else mains
+
+
 def emit_context(by_session, now, cfg):
     """Per-agent context-window usage, so you can see at a glance how much room is
     left in each running session. 'Agents' = the open main sessions (one per live
@@ -830,27 +854,7 @@ def emit_context(by_session, now, cfg):
         return
 
     live_n, by_dir = live_session_cwds()
-
-    # Main sessions: prefer the precise process signal — for each working dir show
-    # the N most-recently-active sessions where N = live `claude` processes there,
-    # so closed sessions can't linger. (by_dir == {} means processes were readable
-    # and none are running, which correctly yields no rows.)
-    if by_dir is not None:
-        budget = dict(by_dir)
-        mains = []
-        for k, v in cand:
-            c = norm(v)
-            if budget.get(c, 0) > 0:
-                mains.append((k, v))
-                budget[c] -= 1
-    else:
-        # We couldn't locate sessions by dir. Use a short recency window so a closed
-        # session lingers for minutes, not hours; if pgrep at least gave us a count,
-        # cap to it so we never show more rows than there are open sessions.
-        cut = now_ts - CONTEXT_ACTIVE_MIN * 60
-        mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
-        if live_n:
-            mains = mains[:live_n]
+    mains = select_live_mains(cand, live_n, by_dir, now_ts)
 
     # Subagents: still-running ones (parent hasn't resumed) in a live working dir
     # (or, when we can't see dirs, just the still-running ones).
