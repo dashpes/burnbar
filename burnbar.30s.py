@@ -501,6 +501,20 @@ def emit_update(latest):
     sep()
 
 
+def emit_version_footer(update_avail):
+    """A small version line pinned to the bottom of the menu, so users can see at a
+    glance which burnbar they're running — and, when one's out, that an update is
+    available (the row pulls it when clicked)."""
+    sep()
+    if update_avail:
+        emit(f"burnbar v{VERSION} · v{update_avail} available",
+             size=CONTEXT_TEXT_SIZE, color=adaptive(TH["grad"][0]),
+             sfimage="arrow.down.circle",
+             action="/bin/bash", args=["-lc", update_command()], terminal=True)
+    else:
+        emit(f"burnbar v{VERSION}", size=CONTEXT_TEXT_SIZE, color=MUTED)
+
+
 # ─────────────────────────── data load ───────────────────────────
 def parse_file(fp, project, session, tz):
     """Parse one transcript -> (json-serializable aggregate, [records])."""
@@ -995,6 +1009,7 @@ def main():
             emit_update(update_avail)
         emit("Refresh", refresh=True)
         settings_menu(cfg)
+        emit_version_footer(update_avail)
         return
 
     all_tok = data["all_tok"]
@@ -1100,6 +1115,7 @@ def main():
     emit("Refresh", refresh=True, sfimage="arrow.clockwise")
     emit("Open transcripts folder", sfimage="folder",
          open_path=os.path.expanduser("~/.claude/projects"))
+    emit_version_footer(update_avail)
 
 
 def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
