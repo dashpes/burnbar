@@ -22,12 +22,15 @@ Settings are stored in ~/.config/burnbar/config.json and changed by clicking
 items in the Settings submenu (which re-invoke this script with --set).
 """
 
+import base64
 import glob
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
+import zlib
 from datetime import date, datetime, timedelta, timezone
 
 # ─────────────────────────── fixed config ───────────────────────────
@@ -123,6 +126,38 @@ THEMES = {
 # Module-level theme/derived colors; set in main() once config is loaded.
 TH = THEMES["default"]
 MUTED = TH["muted"]
+
+
+# ── theme swatches: SwiftBar can't render multi-color text (ANSI is 16-color and
+#    mangles truecolor), so to preview a theme's gradient in the picker we draw a
+#    tiny PNG of its colour stops and hand it to the item as a base64 `image=`.
+#    Pure stdlib (zlib + struct) — no Pillow, keeps burnbar dependency-free.
+def _png(width, height, pixels):
+    """Encode raw RGB bytes (width*height*3) as a minimal 8-bit truecolor PNG."""
+    raw = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw.append(0)                       # filter type 0 (none) per scanline
+        raw += pixels[y * stride:(y + 1) * stride]
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9)) + chunk(b"IEND", b""))
+
+
+def theme_swatch(grad, seg=11, height=12):
+    """A base64 PNG of a theme's gradient: one solid block per colour stop — which
+    mirrors how the burn bar actually picks a single stop by severity, not a blend."""
+    stops = [(int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)) for c in grad]
+    width = seg * len(stops)
+    row = bytearray()
+    for x in range(width):
+        row += bytes(stops[min(x // seg, len(stops) - 1)])
+    return base64.b64encode(_png(width, height, bytes(row) * height)).decode()
 
 
 # ─────────────────────────── config i/o ───────────────────────────
@@ -430,10 +465,13 @@ def pretty_project(dirname):
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
 def emit(text, sub=0, color=None, sfimage=None, size=13, refresh=False,
-         action=None, args=None, open_path=None, header=False, terminal=False):
+         action=None, args=None, open_path=None, header=False, terminal=False,
+         image=None):
     prefix = "--" * sub
     params = [f"font={MONO} size={12 if header else size}"]
     params.append(f"color={color if color is not None else TH['text']}")
+    if image:
+        params.append(f"image={image}")
     if sfimage:
         params.append(f"sfimage={sfimage}")
     if refresh:
@@ -1111,7 +1149,11 @@ def settings_menu(cfg):
 
     emit("Theme")
     for name in THEMES:
-        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1, action=SELF,
+        # Preview each theme by a PNG swatch of its gradient stops — the thing that
+        # actually differs between themes (their font colors are all near-white/black
+        # for readability, so they can't tell the themes apart on their own).
+        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1,
+             image=theme_swatch(THEMES[name]["grad"]), action=SELF,
              args=["--set", f"theme={name}"], refresh=True)
 
     emit("Menu-bar trailer")
