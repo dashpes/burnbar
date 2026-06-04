@@ -711,27 +711,56 @@ def spark(values):
                    for v in values)
 
 
+def limit_view(d, now_epoch, window_secs=None):
+    """Resolve a rate-limit dict (five_hour / seven_day / opus) to what to display.
+
+    While the last-known window is still open, show Anthropic's real numbers — the
+    source of truth. Once its reset time has passed we haven't heard from Anthropic
+    since (these only refresh on a Claude message), and the next window doesn't
+    start until you send one — so show a fresh, full window at ~0%, flagged as an
+    estimate. The moment a message lands, real numbers replace this automatically.
+
+    Returns {"pc", "remaining", "reset", "estimated"}; remaining/reset are None when
+    unknown (no reset time, or a fresh window whose clock hasn't started)."""
+    pc = min(100, max(0, round(d.get("used_percentage") or 0)))
+    reset = d.get("resets_at")
+    if reset and now_epoch >= reset:
+        return {"pc": 0, "remaining": window_secs, "reset": None, "estimated": True}
+    return {"pc": pc, "remaining": (reset - now_epoch) if reset else None,
+            "reset": reset, "estimated": False}
+
+
 def emit_live_limits(usage, now_epoch, tz):
     """The real, cross-surface limits from Anthropic (via the statusLine bridge)."""
     rl = usage["rate_limits"]
     plan = f" · {PLAN_LABEL[PLAN]}" if PLAN else ""
     emit(f"USAGE LIMITS · live{plan}", color=MUTED, sfimage="bolt.fill", header=True)
 
-    def line(label, d):
+    estimated_any = []
+
+    def line(label, d, window=None):
         if not d or d.get("used_percentage") is None:
             return
-        pc = min(100, max(0, round(d["used_percentage"])))
-        reset = d.get("resets_at")
-        rs = ""
-        if reset:
-            rs = f" · {fmt_dur(timedelta(seconds=reset - now_epoch))}"
-            rs += f" ({datetime.fromtimestamp(reset, tz):%H:%M})"
+        v = limit_view(d, now_epoch, window)
+        pc = v["pc"]
+        if v["estimated"]:
+            estimated_any.append(True)
+            # Fresh window: full block remaining, clock not started yet, no fixed
+            # reset time to show.
+            rs = f" · {fmt_dur(timedelta(seconds=v['remaining']))}" if v["remaining"] else ""
+            rs += " · new block"
+        elif v["reset"]:
+            rs = f" · {fmt_dur(timedelta(seconds=v['remaining']))}"
+            rs += f" ({datetime.fromtimestamp(v['reset'], tz):%H:%M})"
+        else:
+            rs = ""
         flag = " (!)" if d.get("status") in ("warning", "rejected", "exceeded") else ""
-        emit(f"{label:<6}{render_bar(pc / 100, BAR_CELLS)} {pc}%{rs}{flag}",
+        pct = f"~{pc}%" if v["estimated"] else f"{pc}%"
+        emit(f"{label:<6}{render_bar(pc / 100, BAR_CELLS)} {pct}{rs}{flag}",
              color=adaptive(color_for(pc)))
 
-    line("5-hr", rl.get("five_hour"))
-    line("7-day", rl.get("seven_day"))
+    line("5-hr", rl.get("five_hour"), BLOCK_HOURS * 3600)
+    line("7-day", rl.get("seven_day"), 7 * 24 * 3600)
     if rl.get("opus"):
         line("Opus", rl.get("opus"))
     cap = usage.get("captured_at")
@@ -741,6 +770,8 @@ def emit_live_limits(usage, now_epoch, tz):
         if age > 120:
             note += f" · {fmt_dur(timedelta(seconds=age))} ago (idle)"
         emit(note, color=MUTED)
+    if estimated_any:
+        emit("~ estimated · send a message to confirm", color=MUTED)
     sep()
 
 
@@ -950,9 +981,10 @@ def main():
     if all_msgs == 0:
         if usage:
             f5 = usage["rate_limits"]["five_hour"]
-            ap = min(100, max(0, round(f5.get("used_percentage") or 0)))
-            print(f"{render_bar(ap / 100, cells)} {ap}% | "
-                  f"font={MONO} size={title_size} color={color_for(ap)}")
+            v = limit_view(f5, now_epoch, BLOCK_HOURS * 3600)
+            pct = f"~{v['pc']}%" if v["estimated"] else f"{v['pc']}%"
+            print(f"{render_bar(v['pc'] / 100, cells)} {pct} | "
+                  f"font={MONO} size={title_size} color={color_for(v['pc'])}")
             sep()
             emit_live_limits(usage, now_epoch, tz)
         else:
@@ -996,15 +1028,16 @@ def main():
     # The REAL 5-hour % from Anthropic (live, cross-surface). The optional trailer
     # is a countdown to reset (default), the token count, or nothing.
     five = usage["rate_limits"]["five_hour"] if usage else None
-    reset_epoch = five.get("resets_at") if five else None
+    view = limit_view(five, now_epoch, BLOCK_HOURS * 3600) if five else None
     extra = ""
-    if cfg["menubar_extra"] == "countdown" and reset_epoch:
-        extra = f" · {fmt_dur(timedelta(seconds=reset_epoch - now_epoch))}"
+    if cfg["menubar_extra"] == "countdown" and view and view["remaining"] is not None:
+        extra = f" · {fmt_dur(timedelta(seconds=view['remaining']))}"
     elif cfg["menubar_extra"] == "tokens":
         extra = f" · {compact(weighted(active['tokens']) if active else 0)}"
-    if usage:
-        ap = min(100, max(0, round(five.get("used_percentage") or 0)))
-        print(f"{render_bar(ap / 100, cells)} {ap}%{extra} | "
+    if usage and view:
+        ap = view["pc"]
+        pct = f"~{ap}%" if view["estimated"] else f"{ap}%"
+        print(f"{render_bar(ap / 100, cells)} {pct}{extra} | "
               f"font={MONO} size={title_size} color={color_for(ap)}")
     else:
         print(f"{render_bar(0, cells)} set up | "

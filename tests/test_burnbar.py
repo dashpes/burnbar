@@ -156,5 +156,44 @@ class TestSelectLiveMains(unittest.TestCase):
         self.assertEqual(bb.select_live_mains(old, None, None, self.now), [])
 
 
+class TestLimitView(unittest.TestCase):
+    """The two-state model behind the live limits: real numbers while the window is
+    open, an estimated fresh window once its reset has passed."""
+
+    def setUp(self):
+        self.now = 1_000_000
+        self.window = 5 * 3600
+
+    def test_live_window_uses_real_numbers(self):
+        d = {"used_percentage": 42, "resets_at": self.now + 1800}  # resets in 30m
+        v = bb.limit_view(d, self.now, self.window)
+        self.assertFalse(v["estimated"])
+        self.assertEqual(v["pc"], 42)
+        self.assertEqual(v["remaining"], 1800)
+        self.assertEqual(v["reset"], self.now + 1800)
+
+    def test_past_reset_is_estimated_fresh(self):
+        d = {"used_percentage": 88, "resets_at": self.now - 60}  # reset a minute ago
+        v = bb.limit_view(d, self.now, self.window)
+        self.assertTrue(v["estimated"])
+        self.assertEqual(v["pc"], 0)                 # fresh, not the stale 88
+        self.assertEqual(v["remaining"], self.window)  # full block, clock not started
+        self.assertIsNone(v["reset"])                # no fixed reset time yet
+
+    def test_exactly_at_reset_counts_as_fresh(self):
+        d = {"used_percentage": 50, "resets_at": self.now}
+        self.assertTrue(bb.limit_view(d, self.now, self.window)["estimated"])
+
+    def test_no_reset_time(self):
+        v = bb.limit_view({"used_percentage": 30}, self.now, self.window)
+        self.assertFalse(v["estimated"])
+        self.assertEqual(v["pc"], 30)
+        self.assertIsNone(v["remaining"])
+
+    def test_missing_percentage_defaults_zero(self):
+        v = bb.limit_view({"resets_at": self.now + 100}, self.now, self.window)
+        self.assertEqual(v["pc"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
