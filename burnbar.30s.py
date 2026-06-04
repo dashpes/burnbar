@@ -43,6 +43,11 @@ CACHE_VERSION = 5                # bumped: per-file aggregates now carry context
 UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
 RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
     "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
+# Releases API, derived from RAW_BASE so a fork only has to override one var.
+_OWNER_REPO = re.search(r"githubusercontent\.com/([^/]+)/([^/]+)/", RAW_BASE)
+API_BASE = ("https://api.github.com/repos/"
+            f"{_OWNER_REPO.group(1)}/{_OWNER_REPO.group(2)}"
+            if _OWNER_REPO else "https://api.github.com/repos/dashpes/burnbar")
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -326,19 +331,34 @@ def version_tuple(s):
 
 
 def fetch_latest_version():
-    """Read just the header of the published plugin and return its <bitbar.version>,
-    or None on any failure. This is the only network call burnbar makes — a plain
-    version GET to GitHub; no usage data ever leaves the machine."""
+    """Latest *published* version, or None on any failure. Prefer the newest GitHub
+    Release tag, so users are only nudged toward released builds — not a transient
+    version bump that's landed on the default branch but isn't out yet. Fall back to
+    the plugin's <bitbar.version> header on the default branch if the releases API
+    can't be reached or no release exists yet. This is the only network call burnbar
+    makes — a plain version GET to GitHub; no usage data ever leaves the machine."""
     import urllib.request
+    # 1. Newest release tag (vX.Y.Z -> X.Y.Z).
+    try:
+        req = urllib.request.Request(
+            f"{API_BASE}/releases/latest",
+            headers={"User-Agent": "burnbar",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            tag = (json.load(r).get("tag_name") or "").lstrip("v")
+        if tag:
+            return tag
+    except Exception:
+        pass
+    # 2. Fall back to the header on the default branch.
     try:
         req = urllib.request.Request(
             f"{RAW_BASE}/burnbar.30s.py",
             headers={"Range": "bytes=0-2047", "User-Agent": "burnbar"})
         with urllib.request.urlopen(req, timeout=3) as r:
-            head = r.read(2048).decode("utf-8", "replace")
+            return parse_version_header(r.read(2048).decode("utf-8", "replace"))
     except Exception:
         return None
-    return parse_version_header(head)
 
 
 def check_update(cfg, now_epoch):
