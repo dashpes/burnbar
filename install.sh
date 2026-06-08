@@ -96,15 +96,48 @@ ln -sf "$PLUGIN" "$DIR/burnbar.30s.py"
 echo "Linked  -> $DIR/burnbar.30s.py"
 
 # 4. Launch at login (so burnbar runs on startup). Idempotent.
-if [ "$DO_LOGIN" = 1 ] && ask "Make SwiftBar launch at login? [Y/n]" y; then
-  osascript >/dev/null 2>&1 <<'OSA' || echo "  (couldn't add login item automatically — toggle it in SwiftBar > Preferences)"
-tell application "System Events"
-  if not (exists login item "SwiftBar") then
-    make login item at end with properties {path:"/Applications/SwiftBar.app", hidden:true}
-  end if
-end tell
-OSA
-  echo "  SwiftBar set to launch at login."
+#    A LaunchAgent is used rather than a System Events login item: the AppleScript
+#    "make login item" approach silently fails on recent macOS, so SwiftBar would
+#    not come back after a reboot. RunAtLoad starts it at login; KeepAlive with
+#    SuccessfulExit=false relaunches it if it crashes, but leaves a manual Quit
+#    (clean exit) alone.
+if [ "$DO_LOGIN" = 1 ] && ask "Make SwiftBar launch at login (and relaunch on crash)? [Y/n]" y; then
+  AGENT="$HOME/Library/LaunchAgents/com.ameba.SwiftBar.plist"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$AGENT" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ameba.SwiftBar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/SwiftBar.app/Contents/MacOS/SwiftBar</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
+PLIST
+  # (Re)load the agent. Quit any manual instance first so launchd owns the process.
+  UID_="$(id -u)"
+  osascript -e 'tell application "SwiftBar" to quit' >/dev/null 2>&1 || true
+  pkill -x SwiftBar >/dev/null 2>&1 || true
+  launchctl bootout "gui/$UID_" "$AGENT" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$UID_" "$AGENT" >/dev/null 2>&1; then
+    launchctl enable "gui/$UID_/com.ameba.SwiftBar" >/dev/null 2>&1 || true
+    echo "  SwiftBar set to launch at login (LaunchAgent installed)."
+  else
+    echo "  (couldn't load the LaunchAgent automatically — toggle Launch at Login in SwiftBar > Preferences)"
+  fi
 fi
 
 # 5. Live usage bridge — real 5h/7d limits + reset times, captured from Claude
