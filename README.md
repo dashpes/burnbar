@@ -15,6 +15,10 @@ exception: an optional once-a-day check to GitHub for a newer version — it sen
 nothing about you, and it's one toggle away in Settings.)
 
 <p align="center">
+  <img src="docs/demo.gif" alt="burnbar demo" width="400">
+</p>
+
+<p align="center">
   <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
   &nbsp;&nbsp;
   <img src="docs/screenshot.png" alt="burnbar detailed view" width="370">
