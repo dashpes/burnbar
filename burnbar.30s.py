@@ -69,6 +69,11 @@ CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
 CONTEXT_NAME_W = 32              # name column width (titles truncated to fit the tree)
 CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
 MONO = "Menlo"
+
+# ── commits-today tracking ──
+COMMIT_DIRS = [os.path.expanduser(p) for p in
+               ("~/Desktop/Programming", "~/Projects", "~/Code", "~/dev")]
+COMMIT_AUTHOR = "jio"
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
 
@@ -461,6 +466,33 @@ def pretty_project(dirname):
         return rest.split("/")[-1] if rest else "home"
     base = p.rstrip("/").split("/")[-1]
     return base or p
+
+
+def count_commits_today():
+    """Count commits by COMMIT_AUTHOR since midnight across COMMIT_DIRS."""
+    total = 0
+    for base in COMMIT_DIRS:
+        if not os.path.isdir(base):
+            continue
+        try:
+            find = subprocess.run(
+                ["find", base, "-maxdepth", "5", "-type", "d", "-name", ".git"],
+                capture_output=True, text=True, timeout=10)
+            for git_dir in find.stdout.splitlines():
+                repo = os.path.dirname(git_dir.strip())
+                if not repo:
+                    continue
+                try:
+                    r = subprocess.run(
+                        ["git", "-C", repo, "log", "--oneline", "--since=midnight",
+                         f"--author={COMMIT_AUTHOR}"],
+                        capture_output=True, text=True, timeout=5)
+                    total += sum(1 for ln in r.stdout.splitlines() if ln.strip())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return total
 
 
 # ─────────────────────── SwiftBar emit helpers ───────────────────────
@@ -1075,16 +1107,20 @@ def main():
     # ════════════════ CONTEXT (live agents) ════════════════
     emit_context(by_session, now, cfg)
 
+    commits_today = count_commits_today()
+
     # ════════════════ TODAY ════════════════
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
     if compact_view:
+        commit_tag = f" · 🔥{commits_today} commits" if commits_today else " · 📝0 commits"
         emit(f"{compact(weighted(today_tok))} tok · {today_msgs} msgs · "
-             f"{len(today_sessions)} sessions")
+             f"{len(today_sessions)} sessions{commit_tag}")
         emit(f"By hour  {spark(today_hours)}")
     else:
         emit(f"Total       {compact(weighted(today_tok)):>8} tok")
         emit(f"Messages    {today_msgs:>8}")
         emit(f"Sessions    {len(today_sessions):>8}")
+        emit(f"Commits     {commits_today:>8}")
         if any(today_hours):
             emit(f"Peak hour   {today_hours.index(max(today_hours)):02d}:00")
         emit(f"By hour  {spark(today_hours)}")
