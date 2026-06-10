@@ -51,20 +51,23 @@ jobs:
           echo "$out" | head -5
           test -n "$out"
 
-      - name: Version bump reminder
-        # Non-blocking nudge: if the plugin changed in a PR but the version
-        # didn't, flag it — the release only fires when the version is new.
-        # One matrix leg is enough; don't double-post the warning.
+      - name: Require version bump
+        # Hard gate: if the plugin changed in a PR but <bitbar.version> didn't,
+        # fail the check. The release only fires on a new version, so an unbumped
+        # change would land on main and never ship — block the merge instead.
+        # One matrix leg is enough; don't double-run on both pythons.
         if: github.event_name == 'pull_request' && matrix.python-version == '3.x'
         run: |
           ver() { grep -m1 -oE '<bitbar\.version>[0-9.]+' "$1" | sed 's/.*>//'; }
           git fetch origin "${{ github.base_ref }}" --depth=1
-          base=$(git show "origin/${{ github.base_ref }}:burnbar.30s.py" | ver /dev/stdin || echo "")
-          head=$(ver burnbar.30s.py)
           if git diff --quiet "origin/${{ github.base_ref }}" -- burnbar.30s.py; then
             echo "burnbar.30s.py unchanged — no bump needed."
-          elif [ "$head" = "$base" ]; then
-            echo "::warning::burnbar.30s.py changed but version is still $head — bump <bitbar.version> if this is a release."
-          else
-            echo "Version $base -> $head."
+            exit 0
           fi
+          base=$(git show "origin/${{ github.base_ref }}:burnbar.30s.py" | ver /dev/stdin || echo "")
+          head=$(ver burnbar.30s.py)
+          if [ "$head" = "$base" ]; then
+            echo "::error::burnbar.30s.py changed but <bitbar.version> is still $head. Bump it before merging — the release only fires on a new version, so this change would never ship."
+            exit 1
+          fi
+          echo "Version bump: $base -> $head."
