@@ -71,9 +71,12 @@ CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer t
 MONO = "Menlo"
 
 # ── commits-today tracking ──
-COMMIT_DIRS = [os.path.expanduser(p) for p in
-               ("~/Desktop/Programming", "~/Projects", "~/Code", "~/dev")]
-COMMIT_AUTHOR = "jio"
+# Default folders scanned for git repos when "commit_dirs" isn't set in config.
+# The author defaults to the user's own git identity (see git_identity), so the
+# count is theirs out of the box — overridable via "commit_author" in config.json.
+COMMIT_DIRS_DEFAULT = [os.path.expanduser(p) for p in
+                       ("~/Developer", "~/Projects", "~/Code", "~/dev",
+                        "~/src", "~/repos")]
 MUTED = "#8e8e93"                # section headers / secondary notes
 SELF = os.path.realpath(__file__)
 
@@ -105,6 +108,9 @@ DEFAULTS = {
     "menubar_extra": "countdown",  # trailer after the %: countdown | tokens | none
     "context_window": "auto",    # how to size the context bar: auto | 200k | 1m
     "update_check": "on",        # daily "is there a newer burnbar?" check: on | off
+    "commits": "on",             # show today's git commit count in TODAY: on | off
+    "commit_author": "",         # whose commits to count; "" = your git identity
+    "commit_dirs": [],           # folders to scan for repos; [] = sensible defaults
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 CONTEXT_WINDOWS = ("auto", "200k", "1m")
@@ -185,6 +191,8 @@ def load_config():
         cfg["context_window"] = "auto"
     if cfg.get("update_check") not in ("on", "off"):
         cfg["update_check"] = "on"
+    if cfg.get("commits") not in ("on", "off"):
+        cfg["commits"] = "on"
     return cfg
 
 
@@ -468,10 +476,26 @@ def pretty_project(dirname):
     return base or p
 
 
-def count_commits_today():
-    """Count commits by COMMIT_AUTHOR since midnight across COMMIT_DIRS."""
+def git_identity():
+    """The user's own git author (email, then name) — used to count *their* commits."""
+    for field in ("user.email", "user.name"):
+        try:
+            r = subprocess.run(["git", "config", "--get", field],
+                               capture_output=True, text=True, timeout=3)
+            val = r.stdout.strip()
+            if val:
+                return val
+        except Exception:
+            pass
+    return ""
+
+
+def count_commits_today(author, dirs):
+    """Count commits by `author` since midnight across `dirs`. No author -> 0."""
+    if not author:
+        return 0
     total = 0
-    for base in COMMIT_DIRS:
+    for base in dirs:
         if not os.path.isdir(base):
             continue
         try:
@@ -485,7 +509,7 @@ def count_commits_today():
                 try:
                     r = subprocess.run(
                         ["git", "-C", repo, "log", "--oneline", "--since=midnight",
-                         f"--author={COMMIT_AUTHOR}"],
+                         f"--author={author}"],
                         capture_output=True, text=True, timeout=5)
                     total += sum(1 for ln in r.stdout.splitlines() if ln.strip())
                 except Exception:
@@ -1107,12 +1131,21 @@ def main():
     # ════════════════ CONTEXT (live agents) ════════════════
     emit_context(by_session, now, cfg)
 
-    commits_today = count_commits_today()
+    # Optional: today's git commit count (toggle in Settings, default on). Only
+    # scan the filesystem when it's on — off costs nothing.
+    show_commits = cfg["commits"] == "on"
+    if show_commits:
+        author = cfg.get("commit_author") or git_identity()
+        dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
+        commits_today = count_commits_today(author, dirs or COMMIT_DIRS_DEFAULT)
 
     # ════════════════ TODAY ════════════════
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
     if compact_view:
-        commit_tag = f" · 🔥{commits_today} commits" if commits_today else " · 📝0 commits"
+        commit_tag = ""
+        if show_commits:
+            commit_tag = (f" · 🔥{commits_today} commits" if commits_today
+                          else " · 📝0 commits")
         emit(f"{compact(weighted(today_tok))} tok · {today_msgs} msgs · "
              f"{len(today_sessions)} sessions{commit_tag}")
         emit(f"By hour  {spark(today_hours)}")
@@ -1120,7 +1153,8 @@ def main():
         emit(f"Total       {compact(weighted(today_tok)):>8} tok")
         emit(f"Messages    {today_msgs:>8}")
         emit(f"Sessions    {len(today_sessions):>8}")
-        emit(f"Commits     {commits_today:>8}")
+        if show_commits:
+            emit(f"Commits     {commits_today:>8}")
         if any(today_hours):
             emit(f"Peak hour   {today_hours.index(max(today_hours)):02d}:00")
         emit(f"By hour  {spark(today_hours)}")
@@ -1264,6 +1298,11 @@ def settings_menu(cfg):
     for opt, lbl in (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")):
         emit(f"{mark(cfg['update_check']==opt)}{lbl}", sub=1, action=SELF,
              args=["--set", f"update_check={opt}"], refresh=True)
+
+    emit("Commits today")
+    for opt, lbl in (("on", "On (your git commits)"), ("off", "Off")):
+        emit(f"{mark(cfg['commits']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"commits={opt}"], refresh=True)
 
     # Live-usage status: on when the statusLine bridge has written real data.
     if load_usage():
