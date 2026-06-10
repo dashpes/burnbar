@@ -35,7 +35,7 @@ Click it for a **Stats-style dropdown** with SF Symbol section headers:
   live `claude` processes to their working dir, so a window you closed drops off
   right away), labels each with Claude's own session title (the one in the resume
   picker), and nests any subagents under the session that spawned them
-- **Today** — total tokens, messages, sessions, peak hour, hourly sparkline, by model
+- **Today** — total tokens, messages, sessions, today's git commits, peak hour, hourly sparkline, by model
 - **Last 7 days** — per-day mini bars, week + month totals
 - **All time** — totals, raw vs effective tokens, sessions, projects, daily
   average, 24-hour activity sparkline, by model, by project, top sessions
@@ -124,6 +124,11 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
   `200K`, or `1M` (see below)
 - **Check for updates** — `Daily` (default; a version-only GET to GitHub, see
   [Updating](#updating)) or `Off` (no network calls at all)
+- **Commits today** — `On` (default) shows a count of *your* git commits made
+  today in the Today section, or `Off` to hide it (which also skips the scan).
+  Auto-detects you from your `git config` identity and scans common code folders
+  (`~/Developer`, `~/Projects`, `~/Code`, `~/dev`, `~/src`, `~/repos`); override
+  the author or folders with `commit_author` / `commit_dirs` in `config.json`.
 
 ## How the live limits work
 
