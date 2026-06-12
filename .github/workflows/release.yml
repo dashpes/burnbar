@@ -45,5 +45,9 @@ jobs:
           fi
           git tag "$tag"
           git push origin "$tag"
-          gh release create "$tag" --title "$tag" --generate-notes
+          # version.txt anchors the anonymous install counter: the plugin's daily
+          # update check fetches releases/latest/download/version.txt, so GitHub's
+          # download_count for this asset becomes a server-side active-install tally.
+          printf '%s\n' "${{ steps.v.outputs.version }}" > version.txt
+          gh release create "$tag" --title "$tag" --generate-notes version.txt
           echo "Published $tag."
