@@ -221,7 +221,13 @@ def coerce(key, value):
 
 
 def handle_cli(argv):
-    """`--set key=value [key=value ...]` writes config; SwiftBar refreshes after."""
+    """`--set key=value [key=value ...]` writes config; SwiftBar refreshes after.
+    `--self-update` runs the in-place update (the menu's Update row re-invokes us
+    with this flag rather than handing SwiftBar a raw `curl … | bash` command,
+    which a terminal=true action word-splits and breaks — see self_update)."""
+    if argv and argv[0] == "--self-update":
+        self_update()
+        return
     if argv and argv[0] == "--set":
         cfg = load_config()
         for kv in argv[1:]:
@@ -467,6 +473,30 @@ def update_command():
     return f"curl -fsSL '{RAW_BASE}/install.sh' | bash -s -- -y"
 
 
+def self_update():
+    """Run the in-place update, invoked as `burnbar.30s.py --self-update` in a Terminal
+    window from the menu's Update row. The row can't hand SwiftBar the raw
+    `curl … | bash` / `git … && open` string directly: for a terminal=true action
+    SwiftBar word-splits the parameters, so `/bin/bash -lc` ends up with just the first
+    token (`curl`/`git`) and the rest scatter onto the command line — curl then runs
+    with no URL ("curl: try 'curl --help' …") and the update fails. Here Python builds
+    the argv itself, so the shell receives the whole pipeline as one intact argument."""
+    import subprocess
+    cmd = update_command()
+    print(f"burnbar {VERSION}: updating…\n\n    {cmd}\n", flush=True)
+    rc = subprocess.call(["/bin/bash", "-lc", cmd])
+    if rc == 0:
+        print("\nburnbar: update complete.", flush=True)
+        subprocess.call(["/usr/bin/open", "swiftbar://refreshallplugins"])
+    else:
+        print(f"\nburnbar: update failed (exit {rc}). "
+              "See README → Updating to update by hand.", flush=True)
+    try:                     # keep the Terminal window open so the result is readable
+        input("\nPress Return to close this window. ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 PLAN_LABEL = {"pro": "Pro", "max5": "Max 5×", "max20": "Max 20×"}
 PLAN = None  # set in main() from ~/.claude.json
 
@@ -573,7 +603,7 @@ def emit_update(latest):
     (opens Terminal so the pull/install is visible)."""
     emit(f"Update to {latest} (on {VERSION})", color=adaptive(TH["grad"][0]),
          sfimage="arrow.down.circle.fill",
-         action="/bin/bash", args=["-lc", update_command()], terminal=True)
+         action=SELF, args=["--self-update"], terminal=True)
     sep()
 
 
@@ -586,7 +616,7 @@ def emit_version_footer(update_avail):
         emit(f"burnbar v{VERSION} · v{update_avail} available",
              size=CONTEXT_TEXT_SIZE, color=adaptive(TH["grad"][0]),
              sfimage="arrow.down.circle",
-             action="/bin/bash", args=["-lc", update_command()], terminal=True)
+             action=SELF, args=["--self-update"], terminal=True)
     else:
         emit(f"burnbar v{VERSION}", size=CONTEXT_TEXT_SIZE, color=MUTED)
 
