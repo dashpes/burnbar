@@ -95,8 +95,16 @@ version-only GET — nothing about your usage is sent). When one is out, an
 Terminal and updates in place — `git pull` for a checkout, or a re-run of
 `install.sh` for a `curl` install — then refreshes SwiftBar.
 
+That daily check is also the only "analytics" burnbar has: it fetches a tiny
+`version.txt` attached to the latest release, so GitHub's own **download count**
+for that file acts as an anonymous, aggregate tally of active installs. It's the
+same version-only GET — no identifier, no usage, nothing about you is sent; the
+count lives server-side on GitHub, and it's how I gauge whether anyone's actually
+using this.
+
 Don't want the check? Flip **Settings → Check for updates → Off**; burnbar then
-makes no network calls at all. You can always update by hand:
+makes no network calls at all — which also opts you out of the install count. You
+can always update by hand:
 
 ```sh
 # checkout install

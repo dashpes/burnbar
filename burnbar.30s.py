@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.2.0</bitbar.version>
+# <bitbar.version>1.3.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -46,11 +46,17 @@ CACHE_VERSION = 5                # bumped: per-file aggregates now carry context
 UPDATE_INTERVAL = 86400          # check GitHub for a newer version at most once a day
 RAW_BASE = os.environ.get(       # where install.sh + the plugin live (overridable for forks)
     "BURNBAR_RAW", "https://raw.githubusercontent.com/dashpes/burnbar/main")
-# Releases API, derived from RAW_BASE so a fork only has to override one var.
+# Owner/repo derived from RAW_BASE so a fork only has to override one var.
 _OWNER_REPO = re.search(r"githubusercontent\.com/([^/]+)/([^/]+)/", RAW_BASE)
-API_BASE = ("https://api.github.com/repos/"
-            f"{_OWNER_REPO.group(1)}/{_OWNER_REPO.group(2)}"
-            if _OWNER_REPO else "https://api.github.com/repos/dashpes/burnbar")
+_OWNER, _REPO = (_OWNER_REPO.group(1), _OWNER_REPO.group(2)) if _OWNER_REPO \
+    else ("dashpes", "burnbar")
+API_BASE = f"https://api.github.com/repos/{_OWNER}/{_REPO}"
+# Stable "latest release" asset URL. The daily version check fetches this tiny
+# file to learn the newest version; because it's a real release asset, GitHub
+# increments its public download_count on each fetch — an anonymous, server-side
+# tally of active installs. No per-user data is sent; it's the same version-only
+# GET, and turning the update check off (Settings) opts out of the count too.
+VERSION_ASSET_URL = f"https://github.com/{_OWNER}/{_REPO}/releases/latest/download/version.txt"
 RECENT_DAYS = 3                  # keep it lean: only files newer than this are
 #                                  re-parsed each refresh (for recent blocks); older
 #                                  ones are read once and served from cache. Smaller
@@ -215,7 +221,13 @@ def coerce(key, value):
 
 
 def handle_cli(argv):
-    """`--set key=value [key=value ...]` writes config; SwiftBar refreshes after."""
+    """`--set key=value [key=value ...]` writes config; SwiftBar refreshes after.
+    `--self-update` runs the in-place update (the menu's Update row re-invokes us
+    with this flag rather than handing SwiftBar a raw `curl … | bash` command,
+    which a terminal=true action word-splits and breaks — see self_update)."""
+    if argv and argv[0] == "--self-update":
+        self_update()
+        return
     if argv and argv[0] == "--set":
         cfg = load_config()
         for kv in argv[1:]:
@@ -380,13 +392,27 @@ def version_tuple(s):
 
 def fetch_latest_version():
     """Latest *published* version, or None on any failure. Prefer the newest GitHub
-    Release tag, so users are only nudged toward released builds — not a transient
-    version bump that's landed on the default branch but isn't out yet. Fall back to
-    the plugin's <bitbar.version> header on the default branch if the releases API
-    can't be reached or no release exists yet. This is the only network call burnbar
-    makes — a plain version GET to GitHub; no usage data ever leaves the machine."""
+    Release, so users are only nudged toward released builds — not a transient
+    version bump that's landed on the default branch but isn't out yet. Falls back
+    through the releases API and finally the plugin's <bitbar.version> header on the
+    default branch. This is the only network call burnbar makes — a plain version GET
+    to GitHub; no usage data ever leaves the machine. The first hit fetches a tiny
+    version.txt release asset, so GitHub's own download_count doubles as an anonymous
+    active-install tally (see README -> Updating)."""
     import urllib.request
-    # 1. Newest release tag (vX.Y.Z -> X.Y.Z).
+    # 1. The latest release's version.txt asset: returns the bare version string,
+    #    and the fetch ticks GitHub's download_count (the anonymous install counter).
+    #    The regex guard rejects a 404 HTML body so a missing asset falls through.
+    try:
+        req = urllib.request.Request(
+            VERSION_ASSET_URL, headers={"User-Agent": "burnbar"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            v = r.read(64).decode("utf-8", "replace").strip().lstrip("v")
+        if re.match(r"^\d+(\.\d+)*$", v):
+            return v
+    except Exception:
+        pass
+    # 2. Releases API (covers a latest release published before version.txt existed).
     try:
         req = urllib.request.Request(
             f"{API_BASE}/releases/latest",
@@ -398,7 +424,7 @@ def fetch_latest_version():
             return tag
     except Exception:
         pass
-    # 2. Fall back to the header on the default branch.
+    # 3. Fall back to the header on the default branch.
     try:
         req = urllib.request.Request(
             f"{RAW_BASE}/burnbar.30s.py",
@@ -445,6 +471,30 @@ def update_command():
     if os.path.isdir(os.path.join(here, ".git")):
         return f"git -C '{here}' pull --ff-only && open 'swiftbar://refreshallplugins'"
     return f"curl -fsSL '{RAW_BASE}/install.sh' | bash -s -- -y"
+
+
+def self_update():
+    """Run the in-place update, invoked as `burnbar.30s.py --self-update` in a Terminal
+    window from the menu's Update row. The row can't hand SwiftBar the raw
+    `curl … | bash` / `git … && open` string directly: for a terminal=true action
+    SwiftBar word-splits the parameters, so `/bin/bash -lc` ends up with just the first
+    token (`curl`/`git`) and the rest scatter onto the command line — curl then runs
+    with no URL ("curl: try 'curl --help' …") and the update fails. Here Python builds
+    the argv itself, so the shell receives the whole pipeline as one intact argument."""
+    import subprocess
+    cmd = update_command()
+    print(f"burnbar {VERSION}: updating…\n\n    {cmd}\n", flush=True)
+    rc = subprocess.call(["/bin/bash", "-lc", cmd])
+    if rc == 0:
+        print("\nburnbar: update complete.", flush=True)
+        subprocess.call(["/usr/bin/open", "swiftbar://refreshallplugins"])
+    else:
+        print(f"\nburnbar: update failed (exit {rc}). "
+              "See README → Updating to update by hand.", flush=True)
+    try:                     # keep the Terminal window open so the result is readable
+        input("\nPress Return to close this window. ")
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 
 PLAN_LABEL = {"pro": "Pro", "max5": "Max 5×", "max20": "Max 20×"}
@@ -553,7 +603,7 @@ def emit_update(latest):
     (opens Terminal so the pull/install is visible)."""
     emit(f"Update to {latest} (on {VERSION})", color=adaptive(TH["grad"][0]),
          sfimage="arrow.down.circle.fill",
-         action="/bin/bash", args=["-lc", update_command()], terminal=True)
+         action=SELF, args=["--self-update"], terminal=True)
     sep()
 
 
@@ -566,7 +616,7 @@ def emit_version_footer(update_avail):
         emit(f"burnbar v{VERSION} · v{update_avail} available",
              size=CONTEXT_TEXT_SIZE, color=adaptive(TH["grad"][0]),
              sfimage="arrow.down.circle",
-             action="/bin/bash", args=["-lc", update_command()], terminal=True)
+             action=SELF, args=["--self-update"], terminal=True)
     else:
         emit(f"burnbar v{VERSION}", size=CONTEXT_TEXT_SIZE, color=MUTED)
 
