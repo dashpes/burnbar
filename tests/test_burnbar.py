@@ -227,18 +227,23 @@ class TestProviders(unittest.TestCase):
         return c
 
     def test_active_providers_modes(self):
-        self.assertEqual(bb.active_providers(self.cfg("claude")),
-                         {"claude": True, "cursor": False})
-        self.assertEqual(bb.active_providers(self.cfg("cursor")),
-                         {"claude": False, "cursor": True})
-        self.assertEqual(bb.active_providers(self.cfg("both")),
-                         {"claude": True, "cursor": True})
+        active = bb.active_providers(self.cfg("claude"))
+        self.assertTrue(active["claude"])
+        self.assertFalse(active["cursor"])
+        # A legacy pin was exhaustive, so agents added later must stay off.
+        self.assertFalse(any(v for k, v in active.items() if k != "claude"))
+        active = bb.active_providers(self.cfg("cursor"))
+        self.assertTrue(active["cursor"])
+        self.assertFalse(active["claude"])
+        active = bb.active_providers(self.cfg("both"))
+        self.assertTrue(active["claude"] and active["cursor"])
 
     def test_auto_uses_detect(self):
         with mock.patch.object(bb, "detect_claude", return_value=True), \
              mock.patch.object(bb, "detect_cursor", return_value=False):
-            self.assertEqual(bb.active_providers(self.cfg("auto")),
-                             {"claude": True, "cursor": False})
+            active = bb.active_providers(self.cfg("auto"))
+            self.assertTrue(active["claude"])
+            self.assertFalse(active["cursor"])
 
     def test_cursor_project_slug(self):
         self.assertEqual(bb._cursor_project_slug("Users-me-Dev-burnbar"), "burnbar")
@@ -708,7 +713,7 @@ class TestProviderRegistry(unittest.TestCase):
 
     NOW = 1_000_000
 
-    def fake(self, key="opencode", label="OpenCode", detected=True):
+    def fake(self, key="faketool", label="FakeTool", detected=True):
         return {
             "key": key, "label": label, "icon": "chevron.left.forwardslash.chevron.right",
             "detect": lambda: detected,
@@ -739,12 +744,12 @@ class TestProviderRegistry(unittest.TestCase):
         with self.registered(extra):
             cfg = dict(bb.DEFAULTS)
             bb.migrate_providers(cfg)
-            self.assertEqual(cfg["provider_opencode"], "on")
-            self.assertTrue(bb.active_providers(cfg)["opencode"])
+            self.assertEqual(cfg["provider_faketool"], "on")
+            self.assertTrue(bb.active_providers(cfg)["faketool"])
             # ...and can be pinned off without touching the other agents.
-            cfg.update(providers_mode="manual", provider_opencode="off")
+            cfg.update(providers_mode="manual", provider_faketool="off")
             active = bb.active_providers(cfg)
-            self.assertFalse(active["opencode"])
+            self.assertFalse(active["faketool"])
             self.assertTrue(active["claude"])
 
     def test_new_provider_joins_the_shared_agent_list(self):
@@ -758,10 +763,10 @@ class TestProviderRegistry(unittest.TestCase):
             rows = bb.unified_agent_rows(
                 bb.claude_agent_rows({"mains": mains}, cfg, self.NOW)
                 + extra["rows"](None, cfg, self.NOW))
-            self.assertEqual([r["prov"] for r in rows], ["opencode", "claude"])
+            self.assertEqual([r["prov"] for r in rows], ["faketool", "claude"])
             self.assertEqual(rows[0]["tier"], 3)          # 150K on 200K bands -> rot
             out = TestMenuRendering.render(bb.emit_agents, rows, {}, self.NOW, cfg)
-            self.assertIn("OpenCode", out)
+            self.assertIn("FakeTool", out)
             self.assertIn(f"sfimage={extra['icon']}", out)
 
     def test_new_provider_gets_a_today_line_and_a_settings_row(self):
@@ -772,17 +777,17 @@ class TestProviderRegistry(unittest.TestCase):
             prov = bb.active_providers(cfg)
             # Only the new provider gathers for real; the built-ins would need a
             # populated ~/.claude and ~/.cursor, which this test isn't about.
-            bundles = {"opencode": extra["gather"](None, None, self.NOW)}
+            bundles = {"faketool": extra["gather"](None, None, self.NOW)}
 
             today = TestMenuRendering.render(bb.emit_today, bundles, None, prov)
-            self.assertIn("OpenCode", today)
+            self.assertIn("FakeTool", today)
             self.assertIn("7 turns", today)
             # Its label is padded into the same column as the built-in agents.
-            self.assertRegex(today, r"OpenCode\s+7 turns")
+            self.assertRegex(today, r"FakeTool\s+7 turns")
 
             settings = TestMenuRendering.render(bb.settings_submenu, cfg, prov)
-            self.assertIn("OpenCode", settings)
-            self.assertIn("provider_opencode=off", settings)   # click pins it off
+            self.assertIn("FakeTool", settings)
+            self.assertIn("provider_faketool=off", settings)   # click pins it off
 
     def test_undetected_provider_stays_out_of_the_menu(self):
         extra = self.fake(detected=False)
@@ -790,6 +795,148 @@ class TestProviderRegistry(unittest.TestCase):
             cfg = dict(bb.DEFAULTS)
             bb.migrate_providers(cfg)
             prov = bb.active_providers(cfg)
-            self.assertFalse(prov["opencode"])
-            self.assertNotIn("OpenCode",
+            self.assertFalse(prov["faketool"])
+            self.assertNotIn("FakeTool",
                              TestMenuRendering.render(bb.emit_today, {}, None, prov))
+
+
+class TestOpenCode(unittest.TestCase):
+    """OpenCode keeps everything in SQLite rather than JSON transcripts, and its
+    context figure is the newest *completed* assistant turn. Both are easy to get
+    wrong, so they're pinned here."""
+
+    NOW = 1_000_000
+
+    def test_turn_context_matches_opencodes_own_sidebar(self):
+        """OpenCode shows `tokens.total` — input + output + cache — so burnbar
+        reports the same number rather than a second, subtly different one. This is
+        the exact turn behind a sidebar reading of 15,507."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"total": 15507, "input": 15133, "output": 374,
+                        "cache": {"read": 0, "write": 0}}}), 15507)
+
+    def test_turn_context_falls_back_to_summing_the_parts(self):
+        """Older rows predate `total`; the parts must add up to the same thing."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"input": 15133, "output": 374,
+                        "cache": {"read": 100, "write": 50}}}), 15657)
+
+    def test_in_flight_turn_reports_zero(self):
+        """A turn still streaming has all-zero tokens; it must not be mistaken for
+        an empty context — the caller keeps walking back to the completed one."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}}), 0)
+        self.assertEqual(bb.opencode_turn_context({}), 0)
+
+    def _db(self, tmp, messages):
+        """A minimal OpenCode store: one session plus the given messages."""
+        import sqlite3
+        path = os.path.join(tmp, "opencode.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE session (id TEXT, title TEXT, directory TEXT, "
+                    "model TEXT, time_updated INTEGER, time_archived INTEGER)")
+        con.execute("CREATE TABLE message (id TEXT, session_id TEXT, "
+                    "time_created INTEGER, data TEXT)")
+        con.execute("INSERT INTO session VALUES (?,?,?,?,?,?)",
+                    ("ses_1", "A session", "/w",
+                     json.dumps({"id": "qwen3.6:latest", "providerID": "ollama"}),
+                     int(self.NOW * 1000), None))
+        for i, data in enumerate(messages):
+            con.execute("INSERT INTO message VALUES (?,?,?,?)",
+                        (f"m{i}", "ses_1", int((self.NOW - i) * 1000),
+                         json.dumps(data)))
+        con.commit(); con.close()
+        return path
+
+    def gather(self, messages, win=32_768):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(bb, "OPENCODE_DB", self._db(tmp, messages)), \
+                    mock.patch.object(bb, "opencode_window", return_value=win):
+                now = datetime.fromtimestamp(self.NOW, timezone.utc)
+                return bb.gather_opencode(now, timezone.utc)
+
+    def test_uses_the_newest_completed_turn_not_the_in_flight_one(self):
+        """The bug this guards: the in-flight turn is newest and reports zeros, so
+        reading "the latest turn" literally shows an empty context mid-reply."""
+        data = self.gather([
+            {"role": "assistant", "tokens": {"total": 0, "cache": {}}},        # newest
+            {"role": "user"},
+            {"role": "assistant", "tokens": {"total": 15507, "cache": {}}},
+        ])
+        self.assertEqual(data["sessions"][0]["tok"], 15507)
+
+    def test_rows_carry_percentage_against_the_resolved_window(self):
+        data = self.gather([{"role": "assistant",
+                             "tokens": {"total": 15507, "cache": {}}}])
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            rows = bb.opencode_agent_rows(data, dict(bb.DEFAULTS), self.NOW)
+        self.assertEqual(rows[0]["prov"], "opencode")
+        self.assertEqual(rows[0]["win"], 32_768)
+        self.assertAlmostEqual(rows[0]["pct"], 47.3, places=0)
+
+    def test_unknown_window_claims_no_percentage(self):
+        """Local models aren't in models.dev — OpenCode itself just shows "0% used".
+        Reporting 0% would read as "plenty of room"; None renders as an em dash,
+        and the rot band still works because it reads absolute tokens."""
+        data = self.gather([{"role": "assistant",
+                             "tokens": {"total": 70_000, "cache": {}}}], win=None)
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            rows = bb.unified_agent_rows(
+                bb.opencode_agent_rows(data, dict(bb.DEFAULTS), self.NOW))
+        self.assertIsNone(rows[0]["pct"])
+        self.assertIsNone(rows[0]["win"])
+        self.assertEqual(rows[0]["tier"], 2)          # 70K -> degraded on tokens
+        out = TestMenuRendering.render(bb.emit_agents, rows, {}, self.NOW,
+                                       dict(bb.DEFAULTS))
+        self.assertNotIn("0%", out)
+        self.assertIn("—", out)
+
+    def test_idle_session_is_not_live(self):
+        old = self.NOW - (bb.OPENCODE_STALE_MIN * 60) - 1
+        data = {"sessions": [{"id": "s", "title": "old", "tok": 1000,
+                              "updated": old, "win": 32_768}]}
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            self.assertEqual(bb.opencode_agent_rows(data, dict(bb.DEFAULTS),
+                                                    self.NOW), [])
+
+    def test_missing_database_is_not_an_error(self):
+        with mock.patch.object(bb, "OPENCODE_DB", "/nonexistent/opencode.db"):
+            out = bb.gather_opencode(datetime.now(timezone.utc), timezone.utc)
+        self.assertEqual(out["sessions"], [])
+
+
+class TestWindowResolution(unittest.TestCase):
+    """Hosted models come from the models.dev mirror; local ones from the runtime
+    that loaded them. Order matters — models.dev has no entry for a local model."""
+
+    def test_prefers_models_dev_and_never_calls_ollama(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=200_000), \
+                mock.patch.object(bb, "ollama_context_length") as oll, \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertEqual(bb.opencode_window("anthropic", "claude-haiku-4-5", 0),
+                             200_000)
+            oll.assert_not_called()
+
+    def test_falls_back_to_ollama_for_local_models(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                mock.patch.object(bb, "ollama_context_length", return_value=32_768), \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertEqual(bb.opencode_window("ollama", "qwen3.6:latest", 0), 32_768)
+
+    def test_non_ollama_provider_is_not_probed_locally(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                mock.patch.object(bb, "ollama_context_length") as oll, \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertIsNone(bb.opencode_window("someprovider", "m", 0))
+            oll.assert_not_called()
+
+    def test_cache_hit_skips_both_lookups(self):
+        cache = {"ollama/qwen3.6:latest": {"win": 32_768, "at": 999_999}}
+        with mock.patch.object(bb, "_window_cache", return_value=cache), \
+                mock.patch.object(bb, "models_dev_limit") as mdev:
+            self.assertEqual(bb.opencode_window("ollama", "qwen3.6:latest",
+                                                1_000_000), 32_768)
+            mdev.assert_not_called()

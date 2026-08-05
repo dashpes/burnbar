@@ -7,7 +7,7 @@ run**, in one place, as a progress bar in the macOS menu bar:
 ███▉░ 37% · 3h09m
 ```
 
-Claude Code and Cursor Agent ship today, and more are being added — see
+Claude Code, Cursor Agent and OpenCode ship today, and more are being added — see
 [Adding a provider](#adding-a-provider). burnbar auto-detects what's installed
 and merges every running session into one list, so "how much context has this
 agent burned?" has a single answer regardless of which tool it came from.
@@ -236,6 +236,15 @@ burnbar — keeping the menu bar offline-first.
 - **Cursor session stats** are read from `~/.cursor/projects/**/agent-transcripts`
   and `~/.cursor/chats/**/meta.json` (turn counts and titles — no billed tokens
   on disk).
+- **OpenCode** keeps everything in one SQLite database
+  (`~/.local/share/opencode/opencode.db`) rather than JSON transcripts, which is
+  why its numbers are easy to miss when you go looking for files. burnbar opens it
+  **read-only** through a `file:…?mode=ro` URI, so a refresh can never lock or
+  write the store the running agent owns. Context is the newest *completed*
+  assistant turn's `tokens.total` — the same figure OpenCode shows in its own
+  sidebar, so the two never disagree. (A turn still streaming reports all zeros;
+  burnbar walks back to the last completed one rather than showing an empty
+  context mid-reply.)
 - Agents are **auto-detected** (`claude` / `agent` on PATH, or their config
   dirs). Pin the set under Settings → Providers.
 - The menu bar fill bar is colored green → yellow → orange → red as it climbs,
@@ -272,6 +281,28 @@ process table, which is markedly worse (see [How it works](#how-it-works)).
 
 Per-provider visibility is stored as `provider_<key>` in `config.json`; the key
 is added to the defaults automatically from the registry.
+
+### Context windows for OpenCode models
+
+OpenCode runs both hosted and local models, so the window is resolved in two
+steps: the models.dev mirror it already caches
+(`~/.cache/opencode/models.json` → `provider.models[id].limit.context`) covers
+hosted providers, and for local models — which aren't listed anywhere public —
+burnbar asks whichever runtime loaded them. For Ollama that's
+`http://127.0.0.1:11434/api/ps`, which reports the context length the model was
+actually loaded with. Results are cached for 6 hours in
+`~/.config/burnbar/windows.json`, because the models.dev mirror is ~3.5MB and a
+model's limit effectively never moves.
+
+That loopback request goes to a daemon already running on your machine; nothing
+leaves it, and it's skipped entirely when Ollama isn't listening or the model was
+found in the mirror.
+
+Worth knowing: OpenCode itself reports `0% used` for local models, because it has
+no limit to divide by. burnbar shows the real percentage when the runtime can
+tell it, and an em dash (`—`) with a dashed bar when nothing can — never `0%`,
+which would read as "plenty of room left". The context-rot band still applies
+either way, since that reads absolute tokens rather than a percentage.
 
 Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
 by the model running the latest turn: Opus is the 1M-context model, so an Opus

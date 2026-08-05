@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.7.0</bitbar.version>
+# <bitbar.version>1.8.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>AI coding agent usage: live burn bar + context-rot tracking + stats.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -637,9 +637,36 @@ def claude_proc_count():
 
     Just the count — the caller only needs to know how many sessions exist, not
     where, so this skips the lsof that live_session_cwds pays for."""
+    return proc_count("claude")
+
+
+def reconcile_live(rows, proc_count, now_epoch, fresh_min=CONTEXT_LIVE_MIN):
+    """Which of `rows` [(id, last_seen), newest first] are sessions still open.
+
+    Every agent poses the same problem, and the two available signals fail in
+    opposite directions: per-session activity says *which* session did something
+    but not when one dies (closing a tab looks exactly like idling), while a
+    process count says *how many* are open but not which.
+
+    So cross-check. Anything active within fresh_min is live outright — recent
+    activity is stronger evidence than any process scan, and process enumeration
+    can be restricted (under a sandbox pgrep can miss even the CLI hosting the
+    caller), so it must never veto a session we just heard from. Quieter entries
+    need the count to corroborate them, newest first. proc_count None means the
+    process table was unreadable — corroborate nothing, trust the activity."""
+    fresh_cut = now_epoch - fresh_min * 60
+    beating = [sid for sid, ts in rows if ts >= fresh_cut]
+    quiet = [sid for sid, ts in rows if ts < fresh_cut]
+    if proc_count is None:
+        return set(beating) | set(quiet)
+    return set(beating) | set(quiet[:max(0, proc_count - len(beating))])
+
+
+def proc_count(pattern, exact=True):
+    """How many processes match, or None if the process table can't be read."""
     try:
-        out = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
-                             capture_output=True, text=True, timeout=3).stdout
+        args = ["/usr/bin/pgrep", "-x" if exact else "-f", pattern]
+        out = subprocess.run(args, capture_output=True, text=True, timeout=3).stdout
     except Exception:
         return None
     return len(out.split())
@@ -665,13 +692,7 @@ def live_claude_session_ids(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
     reg = claude_registry_sessions(now_epoch, stale_min)
     if reg is None:
         return None
-    fresh_cut = now_epoch - CONTEXT_LIVE_MIN * 60
-    beating = [sid for sid, ts in reg if ts >= fresh_cut]
-    quiet = [sid for sid, ts in reg if ts < fresh_cut]
-    n = claude_proc_count()
-    if n is None:
-        return set(beating) | set(quiet)     # can't corroborate; trust the registry
-    return set(beating) | set(quiet[:max(0, n - len(beating))])
+    return reconcile_live(reg, claude_proc_count(), now_epoch)
 
 
 def claude_live_agents(by_session, now, cfg):
@@ -809,9 +830,13 @@ def unified_agent_rows(rows):
     shape rather than earning a section of its own."""
     rows = list(rows)
     for r in rows:
-        r["tier"], r["tags"] = ctx_tags(r["tok"], r["pct"], r["win"])
-        r["at_risk"] = r["tier"] >= CTX_RISK_TIER or r["pct"] >= CONTEXT_WARN_PCT
-    rows.sort(key=lambda r: (-r["tier"], -r["tok"], -r["pct"]))
+        # pct is None when the agent doesn't report a window size (a local model
+        # nobody publishes a limit for). The rot band still works — it reads
+        # absolute tokens — but nothing may claim a percentage it doesn't have.
+        pct = r.get("pct")
+        r["tier"], r["tags"] = ctx_tags(r["tok"], pct or 0, r["win"])
+        r["at_risk"] = r["tier"] >= CTX_RISK_TIER or (pct or 0) >= CONTEXT_WARN_PCT
+    rows.sort(key=lambda r: (-r["tier"], -r["tok"], -(r.get("pct") or 0)))
     return rows
 
 
@@ -820,12 +845,17 @@ def emit_agent_row(r):
     bar *length* is how full the window is, bar *colour* is the rot band."""
     # Window labels vary in width ("1M" vs "256K"), so pad to the widest — otherwise
     # the age/tag tail ragged-edges down the column.
+    pct = r.get("pct")
     win = f"/{ctx_label(r['win']):<4}" if r.get("win") else " " * 5
+    # No window means no fill to draw and no percentage to claim: a dashed bar and
+    # an em dash say "unknown", where 0% would say "plenty of room left".
+    bar = render_bar(pct / 100, 6) if pct is not None else "┄" * 6
+    pct_s = f"{round(pct):>3}%" if pct is not None else "   —"
     when = "live" if r["age"] < CONTEXT_LIVE_MIN * 60 else fmt_age(r["age"])
     tail = (" · " + " · ".join(r["tags"])) if r["tags"] else ""
-    emit(f"{AGENT_LABEL.get(r['prov'], '?'):<6} "
+    emit(f"{AGENT_LABEL.get(r['prov'], '?'):<8} "
          f"{ellipsis(r['label'], CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
-         f"{render_bar(r['pct'] / 100, 6)} {round(r['pct']):>3}% "
+         f"{bar} {pct_s} "
          f"{compact(r['tok']):>5}{win} · {when}{tail}",
          color=adaptive(band_color(r["tier"])), size=CONTEXT_TEXT_SIZE,
          sfimage=AGENT_ICON.get(r["prov"]))
@@ -851,13 +881,13 @@ def emit_subagent_rows(kids, now_ts, cfg):
         name = f"{model_short(av.get('model'))}" + (f" {aid}" if aid else "")
         tier, tags = ctx_tags(used, pct, win)
         tail = (" · " + " · ".join(tags)) if tags else ""
-        emit(f"{'':<6} {ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+        emit(f"{'':<8} {ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
              f"{render_bar(frac, 6)} {pct:>3}% "
              f"{compact(used):>5}/{ctx_label(win):<4} · {when}{tail}",
              color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE,
              sfimage=SUBAGENT_ICON)
     if len(kids) > CONTEXT_MAX_AGENTS:
-        emit(f"{'':<6} +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
+        emit(f"{'':<8} +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
              size=CONTEXT_TEXT_SIZE, sfimage=SUBAGENT_ICON)
 
 
@@ -946,11 +976,22 @@ PROVIDERS = (
      "today": lambda pdata: cursor_today_line(pdata),
      "stats": lambda pdata, now_epoch: emit_cursor_stats(pdata, now_epoch),
      "setup": "#cursor-cli"},
+    {"key": "opencode", "label": "OpenCode",
+     "icon": "chevron.left.forwardslash.chevron.right",
+     "detect": lambda: detect_opencode(),
+     "gather": lambda now, tz, now_epoch: gather_opencode(now, tz),
+     "rows": lambda pdata, cfg, now_epoch: opencode_agent_rows(pdata, cfg, now_epoch),
+     "today": lambda pdata: opencode_today_line(pdata),
+     "stats": lambda pdata, now_epoch: emit_opencode_stats(pdata, now_epoch),
+     "setup": "#adding-a-provider"},
 )
 # "Is this agent's statusLine bridge wired up?" — separate from the table so the
 # table stays a plain description of each agent.
+# OpenCode needs no bridge — it records everything in its own SQLite store, so it
+# is "connected" whenever that store exists.
 BRIDGE_CONNECTED = {"claude": lambda: bool(load_usage()),
-                    "cursor": lambda: bool(load_cursor_live())}
+                    "cursor": lambda: bool(load_cursor_live()),
+                    "opencode": lambda: os.path.exists(OPENCODE_DB)}
 PROVIDER_KEYS = tuple(p["key"] for p in PROVIDERS)
 PROVIDER_BY_KEY = {p["key"]: p for p in PROVIDERS}
 # Provider identity on an agent row is carried by the spelled-out label; the icon
@@ -981,8 +1022,12 @@ def migrate_providers(cfg):
     if isinstance(legacy, str) and legacy in LEGACY_PROVIDERS:
         pins = LEGACY_PROVIDERS[legacy]
         cfg["providers_mode"] = "manual" if pins else "auto"
-        for key, val in (pins or {}).items():
-            cfg[f"provider_{key}"] = val
+        # The legacy values were exhaustive ("claude" meant *only* Claude), so any
+        # agent added since must default off, not on. Otherwise upgrading would
+        # silently switch on agents the user had deliberately excluded.
+        for key in PROVIDER_KEYS:
+            if pins is not None:
+                cfg[f"provider_{key}"] = pins.get(key, "off")
     if cfg.get("providers_mode") not in ("auto", "manual"):
         cfg["providers_mode"] = "auto"
     for key in PROVIDER_KEYS:
@@ -1742,6 +1787,232 @@ def live_cursor_procs():
     except Exception:
         pass
     return n
+
+
+# ─────────────────────── OpenCode (SQLite) ───────────────────────
+# OpenCode keeps everything in one SQLite database rather than JSON transcripts,
+# which is why its context numbers are easy to miss when you go looking for files.
+# Everything burnbar needs is in there:
+#   session.*                 title, directory, model, time_updated (ms)
+#   message.data (JSON)       per-turn {tokens:{total,input,output,cache:{read,write}}}
+# The context figure OpenCode shows in its own sidebar is the newest *completed*
+# assistant turn's `tokens.total` — input + output + cache — so burnbar reports the
+# same number rather than a second, subtly different one.
+OPENCODE_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
+OPENCODE_CONFIG = os.path.expanduser("~/.config/opencode")
+OPENCODE_STATE = os.path.expanduser("~/.local/state/opencode")
+# models.dev mirror OpenCode caches: provider -> models -> id -> limit.context.
+OPENCODE_MODELS = os.path.expanduser("~/.cache/opencode/models.json")
+OPENCODE_STALE_MIN = 30          # sessions idle longer than this aren't "live"
+OPENCODE_MAX_SESSIONS = 20       # newest N sessions are enough to find live ones
+# Resolved context windows, cached because the models.dev mirror is ~3.5MB (a 20ms
+# parse) and a model's limit effectively never moves.
+WINDOW_CACHE_PATH = os.path.expanduser("~/.config/burnbar/windows.json")
+WINDOW_CACHE_TTL = 6 * 3600
+OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
+
+
+def detect_opencode():
+    return bool(_which("opencode") or os.path.exists(OPENCODE_DB)
+                or os.path.isdir(OPENCODE_CONFIG) or os.path.isdir(OPENCODE_STATE))
+
+
+def _window_cache():
+    try:
+        with open(WINDOW_CACHE_PATH) as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def _window_cache_put(cache, key, win, now_epoch):
+    cache[key] = {"win": win, "at": now_epoch}
+    try:
+        os.makedirs(os.path.dirname(WINDOW_CACHE_PATH), exist_ok=True)
+        tmp = WINDOW_CACHE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, WINDOW_CACHE_PATH)
+    except Exception:
+        pass
+
+
+def models_dev_limit(provider_id, model_id):
+    """Context limit from OpenCode's models.dev mirror, or None if it isn't listed."""
+    try:
+        with open(OPENCODE_MODELS) as f:
+            db = json.load(f)
+        limit = ((db.get(provider_id) or {}).get("models") or {}) \
+            .get(model_id, {}).get("limit") or {}
+        win = limit.get("context")
+        return int(win) if win else None
+    except Exception:
+        return None
+
+
+def ollama_context_length(model_id):
+    """The context window Ollama actually loaded a model with, or None.
+
+    Local models aren't in models.dev, so neither burnbar nor OpenCode itself can
+    look their limit up — OpenCode's sidebar just reports "0% used". Ollama knows,
+    because it loaded the model, and answers on the loopback interface. This is a
+    request to a daemon already running on this machine; nothing leaves it, and it
+    is skipped entirely when Ollama isn't listening."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(OLLAMA_PS_URL, timeout=1) as r:
+            models = (json.load(r) or {}).get("models") or []
+    except Exception:
+        return None
+    for m in models:
+        if model_id in (m.get("name"), m.get("model")):
+            win = m.get("context_length")
+            return int(win) if win else None
+    return None
+
+
+def opencode_window(provider_id, model_id, now_epoch):
+    """Context window for an OpenCode model: hosted models from the models.dev
+    mirror, local ones from whichever runtime loaded them. None when unknown —
+    which is honest, and the rot bands work on absolute tokens regardless."""
+    key = f"{provider_id}/{model_id}"
+    cache = _window_cache()
+    hit = cache.get(key)
+    if isinstance(hit, dict) and now_epoch - (hit.get("at") or 0) < WINDOW_CACHE_TTL:
+        return hit.get("win")
+    win = models_dev_limit(provider_id, model_id)
+    if not win and "ollama" in (provider_id or "").lower():
+        win = ollama_context_length(model_id)
+    _window_cache_put(cache, key, win, now_epoch)
+    return win
+
+
+def opencode_turn_context(data):
+    """A turn's context occupancy, matching what OpenCode's own sidebar shows.
+
+    Prefers the `total` OpenCode records; falls back to summing the parts for
+    older rows that predate it. Returns 0 for a turn still in flight (all zeros),
+    so the caller keeps walking back to the last completed one."""
+    tok = data.get("tokens") or {}
+    if tok.get("total"):
+        return int(tok["total"])
+    cache = tok.get("cache") or {}
+    return int((tok.get("input") or 0) + (tok.get("output") or 0)
+               + (cache.get("read") or 0) + (cache.get("write") or 0))
+
+
+def gather_opencode(now, tz):
+    """Read OpenCode's SQLite store: live sessions + today's activity.
+
+    Opened read-only through a file: URI so a refresh can never lock or write the
+    database the running agent owns."""
+    import sqlite3
+    now_epoch = now.timestamp()
+    today = datetime.now(tz).date()
+    out = {"sessions": [], "today_turns": 0, "today_sessions": 0, "n_sessions": 0}
+    if not os.path.exists(OPENCODE_DB):
+        return out
+    try:
+        con = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=1.0)
+        con.row_factory = sqlite3.Row
+    except Exception:
+        return out
+    try:
+        rows = con.execute(
+            "SELECT id, title, directory, model, time_updated FROM session "
+            "WHERE time_archived IS NULL ORDER BY time_updated DESC LIMIT ?",
+            (OPENCODE_MAX_SESSIONS,)).fetchall()
+        total = con.execute(
+            "SELECT COUNT(*) FROM session WHERE time_archived IS NULL").fetchone()[0]
+        sessions, today_sessions, today_turns = [], set(), 0
+        for r in rows:
+            try:
+                model = json.loads(r["model"] or "{}")
+            except Exception:
+                model = {}
+            model_id, provider_id = model.get("id") or "", model.get("providerID") or ""
+            # Newest *completed* assistant turn: an in-flight one reports all zeros.
+            ctx, turns = 0, 0
+            for m in con.execute(
+                    "SELECT data, time_created FROM message WHERE session_id = ? "
+                    "ORDER BY time_created DESC LIMIT 40", (r["id"],)):
+                try:
+                    data = json.loads(m["data"])
+                except Exception:
+                    continue
+                if datetime.fromtimestamp((m["time_created"] or 0) / 1000.0,
+                                          tz).date() == today:
+                    turns += 1
+                if not ctx and data.get("role") == "assistant":
+                    ctx = opencode_turn_context(data)
+            updated = (r["time_updated"] or 0) / 1000.0     # OpenCode stores ms
+            if turns:
+                today_turns += turns
+                today_sessions.add(r["id"])
+            sessions.append({
+                "id": r["id"], "title": r["title"] or "",
+                "directory": r["directory"] or "", "model": model_id,
+                "provider": provider_id, "tok": ctx, "updated": updated,
+                "win": opencode_window(provider_id, model_id, now_epoch) if ctx else None,
+            })
+        out.update(sessions=sessions, today_turns=today_turns,
+                   today_sessions=len(today_sessions), n_sessions=total)
+    except Exception:
+        pass
+    finally:
+        con.close()
+    return out
+
+
+def opencode_session_label(sess):
+    if sess.get("title"):
+        return sess["title"]
+    d = sess.get("directory") or ""
+    return os.path.basename(d.rstrip("/")) or d or sess.get("id") or "session"
+
+
+def opencode_agent_rows(pdata, cfg, now_epoch):
+    """OpenCode's live sessions, cross-checked against running processes the same
+    way every other agent's are (see reconcile_live)."""
+    del cfg
+    sessions = (pdata or {}).get("sessions") or []
+    cut = now_epoch - OPENCODE_STALE_MIN * 60
+    recent = [s for s in sessions if s.get("updated", 0) >= cut and s.get("tok")]
+    recent.sort(key=lambda s: -s["updated"])
+    live = reconcile_live([(s["id"], s["updated"]) for s in recent],
+                          proc_count("opencode", exact=False), now_epoch)
+    rows = []
+    for sess in recent[:CONTEXT_MAX_ROWS]:
+        if sess["id"] not in live:
+            continue
+        win = sess.get("win")
+        rows.append({"prov": "opencode", "key": sess["id"],
+                     "label": opencode_session_label(sess),
+                     "tok": sess["tok"], "win": win,
+                     "pct": min(100.0, 100.0 * sess["tok"] / win) if win else None,
+                     "age": now_epoch - sess["updated"]})
+    return rows
+
+
+def opencode_today_line(pdata):
+    if not pdata:
+        return None
+    return (f"{pdata['today_turns']:>7} turns · "
+            f"{plural(pdata['today_sessions'], 'session')}")
+
+
+def emit_opencode_stats(pdata, now_epoch):
+    if not (pdata and pdata.get("sessions")):
+        return
+    emit("OPENCODE", color=MUTED, sfimage=AGENT_ICON["opencode"], header=True, sub=1)
+    emit(f"Sessions    {pdata['n_sessions']:>8}", sub=1)
+    emit("Recent sessions", sub=1)
+    for sess in pdata["sessions"][:10]:
+        win = f"/{ctx_label(sess['win'])}" if sess.get("win") else ""
+        emit(f"{ellipsis(opencode_session_label(sess), 22):<22} "
+             f"{compact(sess['tok']):>5}{win} · {fmt_age(now_epoch - sess['updated'])}",
+             sub=2)
 
 
 # ─────────────────────────── main ───────────────────────────
