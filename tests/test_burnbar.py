@@ -460,37 +460,78 @@ class TestClaudeLiveAgents(unittest.TestCase):
             probe.assert_not_called()
 
 
-class TestLiveClaudeSessionIds(unittest.TestCase):
+class TestClaudeRegistrySessions(unittest.TestCase):
     """The registry is what makes liveness exact instead of inferred."""
-
-    def write(self, tmp, store):
-        path = os.path.join(tmp, "sessions.json")
-        with open(path, "w") as f:
-            json.dump(store, f)
-        return path
 
     def read(self, store, now=1_000_000):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH",
-                                   self.write(tmp, store)):
-                return bb.live_claude_session_ids(now, stale_min=30)
+            path = os.path.join(tmp, "sessions.json")
+            with open(path, "w") as f:
+                json.dump(store, f)
+            with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH", path):
+                return bb.claude_registry_sessions(now, stale_min=30)
 
-    def test_fresh_kept_stale_dropped(self):
+    def test_fresh_kept_stale_dropped_newest_first(self):
         now = 1_000_000
         got = self.read({"sessions": {
-            "fresh": {"captured_at": now - 60},
-            "idle": {"captured_at": now - 31 * 60},
+            "older": {"captured_at": now - 600},
+            "newest": {"captured_at": now - 60},
+            "expired": {"captured_at": now - 31 * 60},
         }}, now)
-        self.assertEqual(got, {"fresh"})
+        self.assertEqual([sid for sid, _ in got], ["newest", "older"])
 
     def test_missing_file_is_unknown_not_empty(self):
-        """None routes to the process-probe fallback; an empty set would wrongly
+        """None routes to the process-probe fallback; an empty list would wrongly
         claim the bridge had reported nothing open."""
         with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH", "/nonexistent/x.json"):
-            self.assertIsNone(bb.live_claude_session_ids(1_000_000))
+            self.assertIsNone(bb.claude_registry_sessions(1_000_000))
 
     def test_garbage_file_is_unknown(self):
         self.assertIsNone(self.read({"sessions": "not-a-dict"}))
+
+
+class TestLiveClaudeSessionIds(unittest.TestCase):
+    """Cross-checking the registry against the process count. The two signals fail
+    in opposite directions, so each covers the other's blind spot."""
+
+    NOW = 1_000_000
+
+    def resolve(self, reg, proc_count):
+        with mock.patch.object(bb, "claude_registry_sessions", return_value=reg), \
+                mock.patch.object(bb, "claude_proc_count", return_value=proc_count):
+            return bb.live_claude_session_ids(self.NOW)
+
+    def test_closed_tab_is_dropped_once_the_count_disagrees(self):
+        """The reported bug: killing a terminal tab stops the heartbeat, which is
+        indistinguishable from idling until the entry ages out. One live process
+        means only the still-beating session survives."""
+        got = self.resolve([("active", self.NOW - 3),
+                            ("killed", self.NOW - 21 * 60)], 1)
+        self.assertEqual(got, {"active"})
+
+    def test_a_recent_heartbeat_outranks_the_process_count(self):
+        """Process enumeration can be restricted — under a sandbox pgrep misses even
+        the CLI hosting the caller — so a count of zero must never veto a session we
+        heard from seconds ago."""
+        got = self.resolve([("active", self.NOW - 3)], 0)
+        self.assertEqual(got, {"active"})
+
+    def test_quiet_sessions_are_kept_when_the_count_backs_them(self):
+        got = self.resolve([("active", self.NOW - 3),
+                            ("idle", self.NOW - 21 * 60)], 2)
+        self.assertEqual(got, {"active", "idle"})
+
+    def test_quiet_sessions_are_taken_newest_first(self):
+        got = self.resolve([("recent_idle", self.NOW - 10 * 60),
+                            ("older_idle", self.NOW - 25 * 60)], 1)
+        self.assertEqual(got, {"recent_idle"})
+
+    def test_unreadable_process_table_trusts_the_registry(self):
+        got = self.resolve([("a", self.NOW - 3), ("b", self.NOW - 21 * 60)], None)
+        self.assertEqual(got, {"a", "b"})
+
+    def test_no_registry_is_unknown(self):
+        self.assertIsNone(self.resolve(None, 1))
 
 
 class TestMenuRendering(unittest.TestCase):

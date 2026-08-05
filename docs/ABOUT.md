@@ -164,9 +164,14 @@ burnbar is meant to live in the background forever, so resource use mattered.
   CLI doesn't hold its transcript open and the file carries no pid — so burnbar
   first inferred it from running processes and their working directories. That
   can't tell two sessions in one directory apart, and it happily listed sessions
-  you'd closed an hour ago. The fix was to stop inferring: the statusLine hook
-  already fires for one *specific* session on every UI update, so recording that
-  turns a guess into direct evidence (and drops a `lsof` call from every refresh).
+  you'd closed an hour ago. Recording the statusLine heartbeat per session id
+  fixes the identity half — but a closed tab simply stops beating, which reads
+  the same as idling. Neither signal is sufficient alone, and they fail in
+  opposite directions, so burnbar cross-checks them: a heartbeat from the last
+  few minutes is proof on its own, and anything quieter has to be corroborated by
+  the process count. Worth knowing that process enumeration can be restricted —
+  under a sandbox `pgrep` can miss even the CLI hosting the caller — which is
+  exactly why a fresh heartbeat is never allowed to be vetoed by it.
 - **One list, not three.** Context used to be printed three times over — a
   top-of-menu risk strip, then again inside each tool's own section. Merging every
   provider into one risk-ranked list said the same thing once, and cut the menu

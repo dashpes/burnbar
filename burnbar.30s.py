@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.6.0</bitbar.version>
+# <bitbar.version>1.6.1</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>CLI agent usage (Claude Code + Cursor): live burn bar + stats dropdown.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -604,14 +604,13 @@ def fresh_cursor_sessions(session_map, now_epoch, stale_min=CURSOR_CTX_STALE_MIN
     return rows
 
 
-def live_claude_session_ids(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
-    """Session ids the Claude statusLine bridge has refreshed recently, or None if
-    the registry isn't there to answer.
+def claude_registry_sessions(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
+    """[(session_id, last_seen)] the Claude statusLine bridge refreshed within
+    stale_min, newest first — or None if there's no registry to answer.
 
-    None means "unknown, go guess" (the pgrep/lsof path) — it is deliberately not
-    the same as an empty set, which means "the bridge is running and says nothing
-    is open". Direct evidence beats inference: the hook fires for one specific
-    session, so this identifies *which* sessions are open, not just how many."""
+    None means "unknown, go guess" (the pgrep/lsof path). It is deliberately not
+    the same as an empty list, which means "the bridge is running and reports
+    nothing open"."""
     try:
         with open(CLAUDE_SESSIONS_PATH) as f:
             store = json.load(f)
@@ -621,8 +620,52 @@ def live_claude_session_ids(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
     if not isinstance(sessions, dict):
         return None
     cut = now_epoch - stale_min * 60
-    return {sid for sid, v in sessions.items()
-            if isinstance(v, dict) and (v.get("captured_at") or 0) >= cut}
+    rows = [(sid, v.get("captured_at") or 0) for sid, v in sessions.items()
+            if isinstance(v, dict) and (v.get("captured_at") or 0) >= cut]
+    rows.sort(key=lambda r: -r[1])
+    return rows
+
+
+def claude_proc_count():
+    """How many Claude Code CLI processes are running, or None if unreadable.
+
+    Just the count — the caller only needs to know how many sessions exist, not
+    where, so this skips the lsof that live_session_cwds pays for."""
+    try:
+        out = subprocess.run(["/usr/bin/pgrep", "-x", "claude"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return None
+    return len(out.split())
+
+
+def live_claude_session_ids(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
+    """Which Claude sessions are open right now, as a set of ids (None = unknown).
+
+    Neither available signal is sufficient alone, and they fail in opposite
+    directions:
+
+      · the registry knows *which* session each heartbeat came from, but a closed
+        tab simply stops beating — indistinguishable from an idle one until the
+        entry ages out;
+      · the process count knows *how many* sessions exist, but nothing about which.
+
+    So: cross-check. A session seen within CONTEXT_LIVE_MIN is kept
+    unconditionally — a heartbeat seconds old is stronger evidence than any
+    process scan, and process enumeration can be restricted (under a sandbox
+    pgrep can miss even the CLI hosting the caller), so it must never be able to
+    veto a session we just heard from. Quieter entries need the count to
+    corroborate them, and are taken newest-first."""
+    reg = claude_registry_sessions(now_epoch, stale_min)
+    if reg is None:
+        return None
+    fresh_cut = now_epoch - CONTEXT_LIVE_MIN * 60
+    beating = [sid for sid, ts in reg if ts >= fresh_cut]
+    quiet = [sid for sid, ts in reg if ts < fresh_cut]
+    n = claude_proc_count()
+    if n is None:
+        return set(beating) | set(quiet)     # can't corroborate; trust the registry
+    return set(beating) | set(quiet[:max(0, n - len(beating))])
 
 
 def claude_live_agents(by_session, now, cfg):

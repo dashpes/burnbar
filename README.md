@@ -215,13 +215,17 @@ burnbar — keeping the menu bar offline-first.
   prefers this when available.
 - **Live Cursor context** comes from Cursor's statusLine (`context_window`) when
   wired; otherwise Cursor contributes session activity only.
-- **Which sessions are live** comes from each bridge's session registry
-  (`claude/sessions.json`, `cursor/sessions.json`): the hook fires on every UI
-  update for one specific session id, so a recent entry is direct evidence that
-  *that* session is open. Without a bridge, burnbar falls back to inferring it
-  from `pgrep claude` plus each process's working directory — which can't tell
-  two sessions in the same directory apart, so it also gates on transcript
-  freshness rather than trusting the process count alone.
+- **Which sessions are live** cross-checks two signals, because each covers the
+  other's blind spot. The bridge's session registry (`claude/sessions.json`,
+  `cursor/sessions.json`) records a heartbeat per session id every time the
+  statusLine hook fires, so it knows exactly *which* sessions are open — but a
+  closed tab just stops beating, which looks like idling until the entry ages
+  out. A `pgrep` count knows *how many* CLI processes exist but not which. So a
+  session heard from in the last 5 minutes is live outright (process enumeration
+  can be restricted, and must never veto a fresh heartbeat), while quieter
+  entries need the process count to corroborate them, newest first. With no
+  bridge at all, burnbar falls back to `pgrep` plus each process's working
+  directory, gated on transcript freshness.
 - **Claude token stats** are read from `~/.claude/projects/**/*.jsonl`: every
   assistant turn's `input` / `output` / `cache_creation` / `cache_read`, deduped
   by message id + request id, grouped into rolling 5-hour blocks and rolled up
