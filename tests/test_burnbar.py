@@ -157,6 +157,15 @@ class TestSelectLiveMains(unittest.TestCase):
         mains = bb.select_live_mains(cand, 2, {"/x": 1, "/y": 1}, self.now)
         self.assertEqual(self.keys(mains), ["a", "c"])  # newest in /x, plus /y
 
+    def test_precise_budget_still_gates_on_recency(self):
+        """The bug this fixes: two processes in one directory handed a slot to the
+        next-newest transcript, so a session closed an hour ago kept showing as a
+        live agent. A live process proves *some* session there is open, never which."""
+        cand = [("fresh", _sv(self.now - 10)),
+                ("dead", _sv(self.now - bb.CLAUDE_CTX_STALE_MIN * 60 - 1))]
+        mains = bb.select_live_mains(cand, 2, {"/work": 2}, self.now)
+        self.assertEqual(self.keys(mains), ["fresh"])
+
     def test_count_only_caps_and_recency_gates(self):
         # lsof blocked: we know 2 procs exist but not where. s3 (60m) is too old.
         mains = bb.select_live_mains(self.cand, 2, None, self.now)
@@ -395,10 +404,8 @@ class TestUnifiedAgentRows(unittest.TestCase):
 
 
 class TestClaudeLiveAgents(unittest.TestCase):
-    def test_subagents_attach_to_parent_and_orphans_go_to_none(self):
-        now = datetime.now(timezone.utc)
-        ts = now.timestamp()
-        by_session = {
+    def by_session(self, ts):
+        return {
             "main1": {"last_ctx": 1000, "mtime": ts, "cwd": "/w", "agent": False,
                       "sid": "main1"},
             "agent-a": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
@@ -407,12 +414,42 @@ class TestClaudeLiveAgents(unittest.TestCase):
             "agent-b": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
                         "sid": "ghost", "agent_id": "bbbb"},
         }
-        with mock.patch.object(bb, "live_session_cwds", return_value=(1, {"/w": 1})):
-            mains, by_parent = bb.claude_live_agents(by_session, now,
-                                                     dict(bb.DEFAULTS))
+
+    def test_subagents_attach_to_parent_and_orphans_go_to_none(self):
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids", return_value=None), \
+                mock.patch.object(bb, "live_session_cwds",
+                                  return_value=(1, {"/w": 1})):
+            mains, by_parent = bb.claude_live_agents(
+                self.by_session(now.timestamp()), now, dict(bb.DEFAULTS))
         self.assertEqual([k for k, _ in mains], ["main1"])
         self.assertEqual([k for k, _ in by_parent["main1"]], ["agent-a"])
         self.assertEqual([k for k, _ in by_parent[None]], ["agent-b"])
+
+    def test_registry_identifies_sessions_and_skips_the_process_probe(self):
+        """With the bridge registry present we know *which* sessions are open, so
+        the expensive pgrep+lsof probe must not run at all."""
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids",
+                               return_value={"main1"}), \
+                mock.patch.object(bb, "live_session_cwds") as probe:
+            mains, by_parent = bb.claude_live_agents(
+                self.by_session(now.timestamp()), now, dict(bb.DEFAULTS))
+        probe.assert_not_called()
+        self.assertEqual([k for k, _ in mains], ["main1"])
+        self.assertEqual([k for k, _ in by_parent["main1"]], ["agent-a"])
+        self.assertNotIn(None, by_parent)   # agent-b's parent isn't live
+
+    def test_registry_saying_nothing_is_open_hides_everything(self):
+        """An empty set is an answer ("bridge is running, nothing is open"), not the
+        absence of one — it must not fall through to the guessing path."""
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids", return_value=set()), \
+                mock.patch.object(bb, "live_session_cwds") as probe:
+            mains, _ = bb.claude_live_agents(self.by_session(now.timestamp()), now,
+                                             dict(bb.DEFAULTS))
+        probe.assert_not_called()
+        self.assertEqual(mains, [])
 
     def test_no_sessions_short_circuits_before_shelling_out(self):
         """The process probe is the expensive call; it must not run when there's
@@ -421,6 +458,39 @@ class TestClaudeLiveAgents(unittest.TestCase):
             self.assertEqual(bb.claude_live_agents({}, datetime.now(timezone.utc),
                                                    dict(bb.DEFAULTS)), ([], {}))
             probe.assert_not_called()
+
+
+class TestLiveClaudeSessionIds(unittest.TestCase):
+    """The registry is what makes liveness exact instead of inferred."""
+
+    def write(self, tmp, store):
+        path = os.path.join(tmp, "sessions.json")
+        with open(path, "w") as f:
+            json.dump(store, f)
+        return path
+
+    def read(self, store, now=1_000_000):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH",
+                                   self.write(tmp, store)):
+                return bb.live_claude_session_ids(now, stale_min=30)
+
+    def test_fresh_kept_stale_dropped(self):
+        now = 1_000_000
+        got = self.read({"sessions": {
+            "fresh": {"captured_at": now - 60},
+            "idle": {"captured_at": now - 31 * 60},
+        }}, now)
+        self.assertEqual(got, {"fresh"})
+
+    def test_missing_file_is_unknown_not_empty(self):
+        """None routes to the process-probe fallback; an empty set would wrongly
+        claim the bridge had reported nothing open."""
+        with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH", "/nonexistent/x.json"):
+            self.assertIsNone(bb.live_claude_session_ids(1_000_000))
+
+    def test_garbage_file_is_unknown(self):
+        self.assertIsNone(self.read({"sessions": "not-a-dict"}))
 
 
 class TestMenuRendering(unittest.TestCase):

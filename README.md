@@ -29,7 +29,7 @@ Click it for a dropdown that stays short — what's happening now at the top lev
 everything else one hover away:
 
 - **LIVE AGENTS** — every running session from every provider in *one* list,
-  worst context first, each row tagged with its provider's SF Symbol (⚡ Claude,
+  worst context first, each row naming its provider (plus an SF Symbol: ⚡ Claude,
   ↖ Cursor). Subagents nest under the session that spawned them. Bar *length* is
   window fill; bar *colour* is the rot band — they're independent signals and
   they're meant to be able to disagree.
@@ -214,7 +214,14 @@ burnbar — keeping the menu bar offline-first.
   `rate_limits` (5-hour / 7-day / Opus) with exact reset times. The menu bar `%`
   prefers this when available.
 - **Live Cursor context** comes from Cursor's statusLine (`context_window`) when
-  wired; otherwise the Cursor section shows session activity only.
+  wired; otherwise Cursor contributes session activity only.
+- **Which sessions are live** comes from each bridge's session registry
+  (`claude/sessions.json`, `cursor/sessions.json`): the hook fires on every UI
+  update for one specific session id, so a recent entry is direct evidence that
+  *that* session is open. Without a bridge, burnbar falls back to inferring it
+  from `pgrep claude` plus each process's working directory — which can't tell
+  two sessions in the same directory apart, so it also gates on transcript
+  freshness rather than trusting the process count alone.
 - **Claude token stats** are read from `~/.claude/projects/**/*.jsonl`: every
   assistant turn's `input` / `output` / `cache_creation` / `cache_read`, deduped
   by message id + request id, grouped into rolling 5-hour blocks and rolled up
@@ -242,8 +249,9 @@ token equally.
 ## Footprint
 
 burnbar creates no growing files of its own — `claude/usage.json`,
-`cursor/live.json`, `cursor/sessions.json`, `config.json`, and `cache.json` are
-all fixed-size or overwritten (sessions prune after 2h idle). The transcripts it
+`claude/sessions.json`, `cursor/live.json`, `cursor/sessions.json`,
+`config.json`, `commits.json`, and `cache.json` are all fixed-size or
+overwritten (session registries prune after 2h idle). The transcripts it
 reads are written and owned by each CLI, not burnbar.
 
 To stay fast no matter how large that history grows, burnbar keeps an

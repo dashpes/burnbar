@@ -160,6 +160,13 @@ burnbar is meant to live in the background forever, so resource use mattered.
 - **Settings without a settings window.** Every option is a clickable menu item
   that re-invokes the script to write a small JSON config and refresh — so you
   get a real settings experience with zero native UI code.
+- **Knowing which agents are actually open.** Nothing on the outside says so — a
+  CLI doesn't hold its transcript open and the file carries no pid — so burnbar
+  first inferred it from running processes and their working directories. That
+  can't tell two sessions in one directory apart, and it happily listed sessions
+  you'd closed an hour ago. The fix was to stop inferring: the statusLine hook
+  already fires for one *specific* session on every UI update, so recording that
+  turns a guess into direct evidence (and drops a `lsof` call from every refresh).
 - **One list, not three.** Context used to be printed three times over — a
   top-of-menu risk strip, then again inside each tool's own section. Merging every
   provider into one risk-ranked list said the same thing once, and cut the menu

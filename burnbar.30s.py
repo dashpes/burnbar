@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.5.0</bitbar.version>
+# <bitbar.version>1.6.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>CLI agent usage (Claude Code + Cursor): live burn bar + stats dropdown.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -43,6 +43,7 @@ PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
 USAGE_PATH = os.path.expanduser("~/.config/burnbar/claude/usage.json")
 USAGE_PATH_LEGACY = os.path.expanduser("~/.config/burnbar/usage.json")
+CLAUDE_SESSIONS_PATH = os.path.expanduser("~/.config/burnbar/claude/sessions.json")
 CURSOR_LIVE_PATH = os.path.expanduser("~/.config/burnbar/cursor/live.json")
 CURSOR_SESSIONS_PATH = os.path.expanduser("~/.config/burnbar/cursor/sessions.json")
 CURSOR_PROJECTS = os.path.expanduser("~/.cursor/projects")
@@ -80,13 +81,23 @@ CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
 CONTEXT_MAX_ROWS = 6             # cap on main sessions shown *per provider*
 CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
-CONTEXT_NAME_W = 26              # name column width (titles truncated to fit the row).
-#                                  Narrower than the bare text would allow: every
-#                                  agent row carries an SF Symbol, which indents it.
+CONTEXT_NAME_W = 20              # name column width (titles truncated to fit the row).
+#                                  Narrow: each row also carries an SF Symbol (which
+#                                  indents it) and a spelled-out provider name.
 CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
 CONTEXT_WARN_PCT = 70            # nearing the window: compaction is coming
 CONTEXT_CRIT_PCT = 85            # compaction imminent — you're about to lose detail
 CURSOR_CTX_STALE_MIN = 30        # drop Cursor statusLine readings older than this
+CLAUDE_CTX_STALE_MIN = 30        # ditto for Claude, once the bridge registry exists.
+#                                  Both providers now answer "is this open?" the same
+#                                  way: their statusLine hook fired recently for that
+#                                  exact session id. Idle longer than this and the
+#                                  context isn't moving anyway, so there's nothing to
+#                                  watch — better than listing a session you closed.
+COMMITS_PATH = os.path.expanduser("~/.config/burnbar/commits.json")
+COMMITS_TTL = 300                # commit scan is the slowest thing here (a find(1)
+#                                  plus a git log per repo); today's count doesn't
+#                                  move fast enough to redo it every 30s refresh.
 
 # ── context rot bands (absolute tokens) ──
 # Degradation tracks *absolute* context size far more than % of window: a 1M-window
@@ -132,6 +143,11 @@ MONO = "Menlo"
 # run, so the bars stay column-aligned however wide the icon renders.
 AGENT_ICON = {"claude": "bolt.fill", "cursor": "cursorarrow"}
 SUBAGENT_ICON = "arrow.turn.down.right"   # subagents nest under their parent row
+# ...but the icon alone doesn't carry it. A monochrome glyph tinted to the row's rot
+# colour reads as decoration, not identity — especially when every visible row
+# happens to be the same provider, so there's no contrast to decode it against. The
+# name is spelled out; the icon just reinforces it.
+AGENT_LABEL = {"claude": "Claude", "cursor": "Cursor"}
 
 # ── commits-today tracking ──
 # Default folders scanned for git repos when "commit_dirs" isn't set in config.
@@ -588,6 +604,27 @@ def fresh_cursor_sessions(session_map, now_epoch, stale_min=CURSOR_CTX_STALE_MIN
     return rows
 
 
+def live_claude_session_ids(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
+    """Session ids the Claude statusLine bridge has refreshed recently, or None if
+    the registry isn't there to answer.
+
+    None means "unknown, go guess" (the pgrep/lsof path) — it is deliberately not
+    the same as an empty set, which means "the bridge is running and says nothing
+    is open". Direct evidence beats inference: the hook fires for one specific
+    session, so this identifies *which* sessions are open, not just how many."""
+    try:
+        with open(CLAUDE_SESSIONS_PATH) as f:
+            store = json.load(f)
+        sessions = store.get("sessions") if isinstance(store, dict) else None
+    except Exception:
+        return None
+    if not isinstance(sessions, dict):
+        return None
+    cut = now_epoch - stale_min * 60
+    return {sid for sid, v in sessions.items()
+            if isinstance(v, dict) and (v.get("captured_at") or 0) >= cut}
+
+
 def claude_live_agents(by_session, now, cfg):
     """The open Claude sessions and the subagents they're currently running.
 
@@ -629,11 +666,19 @@ def claude_live_agents(by_session, now, cfg):
     if not cand and not agent_cand:
         return [], {}
 
-    live_n, by_dir = live_session_cwds()
-    mains = select_live_mains(cand, live_n, by_dir, now_ts)[:CONTEXT_MAX_ROWS]
-    # Subagents: still-running ones (parent hasn't resumed) in a live working dir
-    # (or, when we can't see dirs, just the still-running ones).
-    agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
+    live_ids = live_claude_session_ids(now_ts)
+    if live_ids is None:
+        # No bridge registry: fall back to inferring liveness from running processes.
+        live_n, by_dir = live_session_cwds()
+        mains = select_live_mains(cand, live_n, by_dir, now_ts)[:CONTEXT_MAX_ROWS]
+        # Subagents: still-running ones (parent hasn't resumed) in a live working dir
+        # (or, when we can't see dirs, just the still-running ones).
+        agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
+    else:
+        # Exact: these session ids are open, whatever their working directory.
+        mains = [kv for kv in cand if kv[0] in live_ids
+                 or kv[1].get("sid") in live_ids][:CONTEXT_MAX_ROWS]
+        agents = [kv for kv in agent_cand if kv[1].get("sid") in live_ids]
 
     shown = {k for k, _ in mains}
     by_parent = {}
@@ -715,7 +760,8 @@ def emit_agent_row(r):
     win = f"/{ctx_label(r['win']):<4}" if r.get("win") else " " * 5
     when = "live" if r["age"] < CONTEXT_LIVE_MIN * 60 else fmt_age(r["age"])
     tail = (" · " + " · ".join(r["tags"])) if r["tags"] else ""
-    emit(f"{ellipsis(r['label'], CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+    emit(f"{AGENT_LABEL.get(r['prov'], '?'):<6} "
+         f"{ellipsis(r['label'], CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
          f"{render_bar(r['pct'] / 100, 6)} {round(r['pct']):>3}% "
          f"{compact(r['tok']):>5}{win} · {when}{tail}",
          color=adaptive(band_color(r["tier"])), size=CONTEXT_TEXT_SIZE,
@@ -739,16 +785,16 @@ def emit_subagent_rows(kids, now_ts, cfg):
         age = now_ts - av.get("mtime", now_ts)
         when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
         aid = (av.get("agent_id") or "")[:4]
-        name = f"  {model_short(av.get('model'))}" + (f" {aid}" if aid else "")
+        name = f"{model_short(av.get('model'))}" + (f" {aid}" if aid else "")
         tier, tags = ctx_tags(used, pct, win)
         tail = (" · " + " · ".join(tags)) if tags else ""
-        emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+        emit(f"{'':<6} {ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
              f"{render_bar(frac, 6)} {pct:>3}% "
              f"{compact(used):>5}/{ctx_label(win):<4} · {when}{tail}",
              color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE,
              sfimage=SUBAGENT_ICON)
     if len(kids) > CONTEXT_MAX_AGENTS:
-        emit(f"  +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
+        emit(f"{'':<6} +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
              size=CONTEXT_TEXT_SIZE, sfimage=SUBAGENT_ICON)
 
 
@@ -975,6 +1021,33 @@ def git_identity():
         except Exception:
             pass
     return ""
+
+
+def commits_today(author, dirs, now_epoch, today_iso):
+    """Today's commit count, recomputed at most every COMMITS_TTL seconds.
+
+    The underlying scan is by far the most expensive thing in a refresh — a find(1)
+    over every configured folder plus a `git log` per repo it turns up — and it runs
+    on a 30s timer. Cached on (day, author) so a date rollover or an identity change
+    invalidates it rather than serving yesterday's number."""
+    key = f"{today_iso}|{author}"
+    try:
+        with open(COMMITS_PATH) as f:
+            c = json.load(f)
+        if c.get("key") == key and now_epoch - (c.get("at") or 0) < COMMITS_TTL:
+            return int(c.get("n") or 0)
+    except Exception:
+        pass
+    n = count_commits_today(author, dirs)
+    try:
+        os.makedirs(os.path.dirname(COMMITS_PATH), exist_ok=True)
+        tmp = COMMITS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"key": key, "at": now_epoch, "n": n}, f)
+        os.replace(tmp, COMMITS_PATH)
+    except Exception:
+        pass
+    return n
 
 
 def count_commits_today(author, dirs):
@@ -1291,7 +1364,7 @@ def emit_live_limits(usage, now_epoch, tz):
     """The real, cross-surface limits from Anthropic (via the statusLine bridge)."""
     rl = usage["rate_limits"]
     plan = f" · {PLAN_LABEL[PLAN]}" if PLAN else ""
-    emit(f"LIMITS · live{plan}", color=MUTED, sfimage="bolt.fill", header=True)
+    emit(f"LIMITS · live{plan}", color=MUTED, sfimage="speedometer", header=True)
 
     estimated_any = []
 
@@ -1413,11 +1486,17 @@ def select_live_mains(cand, live_n, by_dir, now_ts):
     def norm(sv):
         return os.path.normpath(sv.get("cwd") or "")
     if by_dir is not None:
+        # A live process in this directory only proves *some* session here is open,
+        # not which one — so the budget alone would hand a slot to whatever
+        # transcript is next-newest, including one closed hours ago. Gate on
+        # freshness too: a session nobody has touched in this long isn't the one
+        # holding that process open.
+        cut = now_ts - CLAUDE_CTX_STALE_MIN * 60
         budget = dict(by_dir)
         mains = []
         for k, v in cand:
             c = norm(v)
-            if budget.get(c, 0) > 0:
+            if budget.get(c, 0) > 0 and v.get("mtime", 0) >= cut:
                 mains.append((k, v))
                 budget[c] -= 1
         return mains
@@ -1597,7 +1676,7 @@ def emit_limits(usage, now_epoch, tz):
     if usage:
         emit_live_limits(usage, now_epoch, tz)
         return
-    emit("LIMITS", color=MUTED, sfimage="bolt.fill", header=True)
+    emit("LIMITS", color=MUTED, sfimage="speedometer", header=True)
     emit("Live usage not set up", color=MUTED)
     emit("Show real 5h / 7d limits", sub=1,
          open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
@@ -1820,7 +1899,8 @@ def main():
         if cfg["commits"] == "on":
             author = cfg.get("commit_author") or git_identity()
             dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
-            commits = count_commits_today(author, dirs or COMMIT_DIRS_DEFAULT)
+            commits = commits_today(author, dirs or COMMIT_DIRS_DEFAULT,
+                                    now_epoch, today.isoformat())
         emit_today(cstats, cdata, commits, prov)
         stats_submenu(data, cstats, cdata, today, tz, now_epoch)
         settings_submenu(cfg)
