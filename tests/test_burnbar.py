@@ -5,7 +5,9 @@ that have actually bitten us — version parsing (broke the release), the live-
 session tier selection (showed closed sessions as live) — plus the token/format
 helpers and multi-provider detection. Run with:  python3 -m unittest discover -s tests
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -46,8 +48,15 @@ class TestVersion(unittest.TestCase):
         self.assertIsNone(bb.parse_version_header("no header here"))
         self.assertIsNone(bb.parse_version_header(None))
 
-    def test_plugin_version_is_1_4(self):
-        self.assertEqual(bb.VERSION, "1.4.0")
+    def test_plugin_version_comes_from_the_header(self):
+        """VERSION must be the parsed <bitbar.version>, never the "0.0.0" fallback —
+        that fallback would make every install look older than the latest release and
+        nag forever. Asserting the invariant, not a literal, so a release bump is a
+        one-line change to the header alone (which CI already gates)."""
+        self.assertRegex(bb.VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertNotEqual(bb.VERSION, "0.0.0")
+        with open(bb.SELF, encoding="utf-8") as f:
+            self.assertEqual(bb.VERSION, bb.parse_version_header(f.read(2048)))
 
 
 class TestFormatting(unittest.TestCase):
@@ -313,6 +322,167 @@ class TestContextRisk(unittest.TestCase):
             [("Roomy", 30.0, 300_000, 1_000_000, {})], [], warn=70)
         self.assertEqual(len(risks), 1)
         self.assertIn("degraded", risks[0][5])
+
+
+class TestUnifiedAgentRows(unittest.TestCase):
+    """The merged LIVE AGENTS list — one list for every provider, replacing the
+    three places context used to be printed."""
+
+    NOW = 1_000_000
+
+    def rows(self, mains=(), cursor=()):
+        return bb.unified_agent_rows(list(mains), dict(bb.DEFAULTS), list(cursor),
+                                     self.NOW)
+
+    def cursor_entry(self, name, pct, size=256_000, age=60):
+        return (name, {"session_name": name, "captured_at": self.NOW - age,
+                       "context_window": {"used_percentage": pct,
+                                          "context_window_size": size}}, float(pct))
+
+    def test_providers_are_merged_and_tagged(self):
+        rows = self.rows(
+            mains=[("s1", {"model": "claude-opus-5", "last_ctx": 300_000,
+                           "peak_ctx": 300_000, "mtime": self.NOW, "title": "C"})],
+            cursor=[self.cursor_entry("X", 65)])
+        self.assertEqual({r["prov"] for r in rows}, {"claude", "cursor"})
+        # Every row must resolve to an icon — that's the only provider cue, since
+        # colour is already carrying the rot band.
+        for r in rows:
+            self.assertIn(r["prov"], bb.AGENT_ICON)
+
+    def test_ranked_by_rot_tier_then_tokens(self):
+        """Same ordering the old risk strip used: how degraded beats how big. The
+        Cursor session carries fewer tokens but is judged against a smaller window,
+        so it outranks the roomy 1M Claude session."""
+        rows = self.rows(
+            mains=[("s1", {"model": "claude-opus-5", "last_ctx": 300_000,
+                           "peak_ctx": 300_000, "mtime": self.NOW, "title": "Roomy"})],
+            cursor=[self.cursor_entry("Hot", 90, size=200_000)])
+        self.assertEqual([r["label"] for r in rows], ["Hot", "Roomy"])
+        self.assertEqual(rows[0]["tier"], 3)      # 180K on 200K bands -> rot
+        self.assertEqual(rows[1]["tier"], 2)      # 300K on 1M bands   -> degraded
+
+    def test_at_risk_flags_both_independent_signals(self):
+        """A session is at risk for either reason, and they don't have to agree:
+        quality decay (tokens past the band) or imminent compaction (% of window)."""
+        rows = self.rows(mains=[
+            ("deep", {"model": "claude-opus-5", "last_ctx": 300_000,
+                      "peak_ctx": 300_000, "mtime": self.NOW, "title": "deep"}),
+            ("full", {"model": "claude-sonnet-5", "last_ctx": 150_000,
+                      "peak_ctx": 150_000, "mtime": self.NOW, "title": "full"}),
+            ("calm", {"model": "claude-sonnet-5", "last_ctx": 5_000,
+                      "peak_ctx": 5_000, "mtime": self.NOW, "title": "calm"}),
+        ])
+        flagged = {r["label"]: r["at_risk"] for r in rows}
+        self.assertTrue(flagged["deep"])   # 30% of 1M, but degraded on tokens
+        self.assertTrue(flagged["full"])   # 75% of 200K, compaction near
+        self.assertFalse(flagged["calm"])
+
+    def test_cursor_rows_capped(self):
+        rows = self.rows(cursor=[self.cursor_entry(f"s{i}", 50)
+                                 for i in range(bb.CONTEXT_MAX_ROWS + 4)])
+        self.assertEqual(len(rows), bb.CONTEXT_MAX_ROWS)
+
+    def test_missing_cursor_window_size_does_not_crash(self):
+        """Cursor omits context_window_size on some builds; the row must still
+        render (no window label, banded against the default floors)."""
+        rows = self.rows(cursor=[("s", {"session_name": "s",
+                                        "captured_at": self.NOW,
+                                        "context_window": {"used_percentage": 80}},
+                                  80.0)])
+        self.assertIsNone(rows[0]["win"])
+        self.assertTrue(rows[0]["at_risk"])
+
+
+class TestClaudeLiveAgents(unittest.TestCase):
+    def test_subagents_attach_to_parent_and_orphans_go_to_none(self):
+        now = datetime.now(timezone.utc)
+        ts = now.timestamp()
+        by_session = {
+            "main1": {"last_ctx": 1000, "mtime": ts, "cwd": "/w", "agent": False,
+                      "sid": "main1"},
+            "agent-a": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
+                        "sid": "main1", "agent_id": "aaaa"},
+            # Parent isn't among the live mains -> orphan bucket.
+            "agent-b": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
+                        "sid": "ghost", "agent_id": "bbbb"},
+        }
+        with mock.patch.object(bb, "live_session_cwds", return_value=(1, {"/w": 1})):
+            mains, by_parent = bb.claude_live_agents(by_session, now,
+                                                     dict(bb.DEFAULTS))
+        self.assertEqual([k for k, _ in mains], ["main1"])
+        self.assertEqual([k for k, _ in by_parent["main1"]], ["agent-a"])
+        self.assertEqual([k for k, _ in by_parent[None]], ["agent-b"])
+
+    def test_no_sessions_short_circuits_before_shelling_out(self):
+        """The process probe is the expensive call; it must not run when there's
+        nothing that could be displayed."""
+        with mock.patch.object(bb, "live_session_cwds") as probe:
+            self.assertEqual(bb.claude_live_agents({}, datetime.now(timezone.utc),
+                                                   dict(bb.DEFAULTS)), ([], {}))
+            probe.assert_not_called()
+
+
+class TestMenuRendering(unittest.TestCase):
+    """The redesign is about output shape, so assert on the emitted menu itself."""
+
+    NOW = 1_000_000
+
+    @staticmethod
+    def render(fn, *a, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*a, **kw)
+        return buf.getvalue()
+
+    def test_agents_carry_a_provider_icon_and_advice_line(self):
+        cfg = dict(bb.DEFAULTS)
+        mains = [("s1", {"model": "claude-sonnet-5", "last_ctx": 150_000,
+                         "peak_ctx": 150_000, "mtime": self.NOW, "title": "Deep"})]
+        cursor = [("c1", {"session_name": "Hot", "captured_at": self.NOW,
+                          "context_window": {"used_percentage": 20,
+                                             "context_window_size": 256_000}}, 20.0)]
+        rows = bb.unified_agent_rows(mains, cfg, cursor, self.NOW)
+        out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+        self.assertIn(f"sfimage={bb.AGENT_ICON['claude']}", out)
+        self.assertIn(f"sfimage={bb.AGENT_ICON['cursor']}", out)
+        self.assertIn("LIVE AGENTS · 2", out)
+        # 150K on 200K bands is rot -> the one actionable line shows up.
+        self.assertIn("/compact", out)
+
+    def test_no_advice_line_when_everything_is_healthy(self):
+        cfg = dict(bb.DEFAULTS)
+        mains = [("s1", {"model": "claude-sonnet-5", "last_ctx": 5_000,
+                         "peak_ctx": 5_000, "mtime": self.NOW, "title": "Calm"})]
+        rows = bb.unified_agent_rows(mains, cfg, [], self.NOW)
+        out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+        self.assertIn("LIVE AGENTS · 1", out)
+        self.assertNotIn("/compact", out)
+        self.assertNotIn("exclamationmark", out)
+
+    def test_subagents_stay_in_the_main_menu(self):
+        """They must render as sibling rows, not a submenu of the parent: a subagent
+        burning context is the last thing that should need a hover to discover."""
+        cfg = dict(bb.DEFAULTS)
+        mains = [("p", {"model": "claude-opus-5", "last_ctx": 1_000, "peak_ctx": 1_000,
+                        "mtime": self.NOW, "title": "Parent"})]
+        kids = {"p": [("a", {"model": "claude-haiku-4-5", "last_ctx": 2_000,
+                             "peak_ctx": 2_000, "mtime": self.NOW,
+                             "agent_id": "aaaa"})]}
+        rows = bb.unified_agent_rows(mains, cfg, [], self.NOW)
+        out = self.render(bb.emit_agents, rows, kids, self.NOW, cfg)
+        kid_line = [ln for ln in out.splitlines() if "haiku" in ln][0]
+        self.assertFalse(kid_line.startswith("--"))
+        self.assertIn(f"sfimage={bb.SUBAGENT_ICON}", kid_line)
+
+    def test_stats_submenu_is_absent_on_a_fresh_install(self):
+        """cdata is a fully-populated dict of zeroes before you have run anything;
+        the Stats row must not appear and lead to empty headers."""
+        empty_cursor = {"sessions": [], "today_turns": 0, "today_sessions": 0,
+                        "live": None, "session_map": {}, "n_sessions": 0}
+        out = self.render(bb.stats_submenu, None, None, empty_cursor,
+                          datetime.now(timezone.utc).date(), timezone.utc, self.NOW)
+        self.assertEqual(out, "")
 
 
 class TestContextBands(unittest.TestCase):

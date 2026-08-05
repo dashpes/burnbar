@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.4.0</bitbar.version>
+# <bitbar.version>1.5.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>CLI agent usage (Claude Code + Cursor): live burn bar + stats dropdown.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -13,8 +13,9 @@ burnbar — a SwiftBar/xbar plugin.
 
 Menu bar:  a live progress bar for your current usage (Claude rate limits when
            available, else Cursor context fill).
-Dropdown:  per-provider sections (Claude Code, Cursor CLI, …) auto-detected from
-           what's installed; Stats-style panel with Settings submenu.
+Dropdown:  one merged LIVE AGENTS list (every provider, worst context first),
+           the real usage limits, a today summary, then Stats and Settings
+           submenus. Providers are auto-detected from what's installed.
 
 Offline-first: reads local transcripts + statusLine bridge files. No API keys,
 no pricing tables. Optional once-a-day GitHub version check only.
@@ -77,9 +78,11 @@ CONTEXT_ACTIVE_MIN = 10          # fallback only (live processes unreadable): tr
                                  # touched this recently as still open
 CONTEXT_AGENT_MIN = 15           # subagents are ephemeral: only show ones still running
 CONTEXT_LIVE_MIN = 5             # freshest sessions get a "live" tag instead of an age
-CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
+CONTEXT_MAX_ROWS = 6             # cap on main sessions shown *per provider*
 CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
-CONTEXT_NAME_W = 32              # name column width (titles truncated to fit the tree)
+CONTEXT_NAME_W = 26              # name column width (titles truncated to fit the row).
+#                                  Narrower than the bare text would allow: every
+#                                  agent row carries an SF Symbol, which indents it.
 CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
 CONTEXT_WARN_PCT = 70            # nearing the window: compaction is coming
 CONTEXT_CRIT_PCT = 85            # compaction imminent — you're about to lose detail
@@ -120,8 +123,15 @@ CTX_BAND_TABLE = (
     (1_000_000, (100_000, 200_000, 400_000)),
 )
 CTX_BAND_NAMES = ("drifting", "degraded", "rot")
-CTX_RISK_TIER = 2                # surface in the at-risk strip from "degraded" up
+CTX_RISK_TIER = 2                # call out the advice line from "degraded" up
 MONO = "Menlo"
+
+# Provider identity in the merged LIVE AGENTS list is carried by *shape*, not
+# colour — colour is already spoken for by the rot band, and one channel can't
+# encode two independent signals. The SF Symbol also sits outside the monospace
+# run, so the bars stay column-aligned however wide the icon renders.
+AGENT_ICON = {"claude": "bolt.fill", "cursor": "cursorarrow"}
+SUBAGENT_ICON = "arrow.turn.down.right"   # subagents nest under their parent row
 
 # ── commits-today tracking ──
 # Default folders scanned for git repos when "commit_dirs" isn't set in config.
@@ -154,7 +164,6 @@ VERSION = _read_self_version() or "0.0.0"
 
 # ── user-configurable defaults (overridden by config.json) ──
 DEFAULTS = {
-    "view": "compact",           # "compact" | "detailed"
     "theme": "default",          # see THEMES
     "menubar_cells": 5,          # bar width in the menu bar
     "title_size": 11,            # menu-bar font size
@@ -236,10 +245,7 @@ def load_config():
         pass
     if cfg.get("theme") not in THEMES:
         cfg["theme"] = "default"
-    if cfg.get("view") in ("default", "expanded"):   # legacy names for the full view
-        cfg["view"] = "detailed"
-    if cfg.get("view") not in ("compact", "detailed"):
-        cfg["view"] = "compact"
+    cfg.pop("view", None)        # retired in 1.5: one layout, deep stats in a submenu
     if cfg.get("menubar_extra") not in MENUBAR_EXTRAS:
         cfg["menubar_extra"] = "countdown"
     if cfg.get("context_window") not in CONTEXT_WINDOWS:
@@ -391,6 +397,10 @@ def ctx_tags(tokens, pct, win=None):
     elif pct >= CONTEXT_WARN_PCT:
         tags.append("near full")
     return tier, tags
+
+
+def plural(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def ellipsis(s, n):
@@ -578,15 +588,28 @@ def fresh_cursor_sessions(session_map, now_epoch, stale_min=CURSOR_CTX_STALE_MIN
     return rows
 
 
-def claude_live_context_rows(by_session, now, cfg):
-    """Same live-session selection as emit_context, returned as (label, pct, sv) for
-    the shared at-risk strip — without printing."""
+def claude_live_agents(by_session, now, cfg):
+    """The open Claude sessions and the subagents they're currently running.
+
+    Returns (mains, by_parent): `mains` is [(key, sv), …] for sessions backed by a
+    live `claude` process, capped at CONTEXT_MAX_ROWS; `by_parent` maps a main's key
+    to its running subagents, with orphans (parent idle, or past the cap) under None.
+
+    'Agents' = the open main sessions (one per live `claude` process) plus the
+    subagents they're currently running."""
+    del cfg                      # window sizing happens at row-build time
     if not by_session:
-        return []
+        return [], {}
     now_ts = now.timestamp()
-    mode = cfg["context_window"]
+
+    def norm(sv):
+        return os.path.normpath(sv.get("cwd") or "")
 
     def agent_running(av):
+        # A subagent's parent session blocks while the subagent runs; once the
+        # parent writes again (the tool result) the subagent has finished — so it's
+        # live only until its parent's transcript passes it. Age is a backstop in
+        # case the parent was killed mid-run and never resumes.
         if now_ts - av.get("mtime", 0) > CONTEXT_AGENT_MIN * 60:
             return False
         parent = by_session.get(av.get("sid"))
@@ -594,17 +617,42 @@ def claude_live_context_rows(by_session, now, cfg):
             return av.get("mtime", 0) >= parent.get("mtime", 0)
         return True
 
+    # Cheap in-memory candidates first, so we only shell out to find live
+    # processes when there's actually something that could be shown.
     cand = sorted((kv for kv in by_session.items()
                    if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
                   key=lambda kv: -kv[1].get("mtime", 0))
+    agent_cand = sorted(((k, v) for k, v in by_session.items()
+                         if v.get("agent") and v.get("last_ctx", 0) > 0
+                         and agent_running(v)),
+                        key=lambda kv: -kv[1].get("mtime", 0))
+    if not cand and not agent_cand:
+        return [], {}
+
     live_n, by_dir = live_session_cwds()
-    mains = select_live_mains(cand, live_n, by_dir, now_ts)
+    mains = select_live_mains(cand, live_n, by_dir, now_ts)[:CONTEXT_MAX_ROWS]
+    # Subagents: still-running ones (parent hasn't resumed) in a live working dir
+    # (or, when we can't see dirs, just the still-running ones).
+    agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
+
+    shown = {k for k, _ in mains}
+    by_parent = {}
+    for k, v in agents:
+        sid = v.get("sid")
+        by_parent.setdefault(sid if sid in shown else None, []).append((k, v))
+    return mains, by_parent
+
+
+def claude_context_rows(mains, cfg):
+    """Live Claude sessions as (label, pct, tokens, window, sv), fullest first."""
+    mode = cfg["context_window"]
     rows = []
-    for _k, sv in mains[:CONTEXT_MAX_ROWS]:
+    for _k, sv in mains:
         win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
         used = sv.get("last_ctx", 0)
-        pct = min(100.0, 100.0 * used / win) if win else 0.0
-        rows.append((ctx_session_label(sv), pct, used, win, sv))
+        rows.append((ctx_session_label(sv),
+                     min(100.0, 100.0 * used / win) if win else 0.0,
+                     used, win, sv))
     rows.sort(key=lambda r: -r[2])
     return rows
 
@@ -629,23 +677,102 @@ def collect_context_risks(claude_rows, cursor_rows, warn=CONTEXT_WARN_PCT):
     return risks
 
 
-def emit_context_risk_strip(risks):
-    """Top-of-menu callout when any live agent is degrading — the context-rot signal.
+def unified_agent_rows(mains, cfg, cursor_rows, now_epoch):
+    """Every live agent, from every provider, in one list — worst context first.
 
-    The bar length is window fill; its colour is the rot band. Those two can
-    disagree (that's the point), so both numbers are shown."""
-    if not risks:
-        return
-    emit("CONTEXT AT RISK", color=MUTED, sfimage="exclamationmark.triangle.fill",
-         header=True)
-    worst = 0
-    for prov, label, pct, tok, tier, tags in risks[:CONTEXT_MAX_ROWS]:
-        worst = max(worst, tier)
+    burnbar used to print this three times over (a top-of-menu risk strip, then
+    again inside each provider's own section). One list, ranked the way the risk
+    itself ranks — rot tier, then absolute tokens, then window fill — says the same
+    thing once. Provider comes back as a per-row icon (see AGENT_ICON)."""
+    mode = cfg["context_window"]
+    rows = []
+    for key, sv in mains:
+        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
+        used = sv.get("last_ctx", 0)
+        rows.append({"prov": "claude", "key": key, "label": ctx_session_label(sv),
+                     "tok": used, "win": win,
+                     "pct": min(100.0, 100.0 * used / win) if win else 0.0,
+                     "age": now_epoch - sv.get("mtime", now_epoch)})
+    for sid, entry, pct in (cursor_rows or [])[:CONTEXT_MAX_ROWS]:
+        cw = entry.get("context_window") or {}
+        rows.append({"prov": "cursor", "key": sid,
+                     "label": cursor_session_label(entry),
+                     "tok": cursor_ctx_tokens(entry) or 0,
+                     "win": cw.get("context_window_size"), "pct": pct,
+                     "age": now_epoch - (entry.get("captured_at") or now_epoch)})
+    for r in rows:
+        r["tier"], r["tags"] = ctx_tags(r["tok"], r["pct"], r["win"])
+        r["at_risk"] = r["tier"] >= CTX_RISK_TIER or r["pct"] >= CONTEXT_WARN_PCT
+    rows.sort(key=lambda r: (-r["tier"], -r["tok"], -r["pct"]))
+    return rows
+
+
+def emit_agent_row(r):
+    """One agent: name, window fill, and the two signals that can disagree —
+    bar *length* is how full the window is, bar *colour* is the rot band."""
+    # Window labels vary in width ("1M" vs "256K"), so pad to the widest — otherwise
+    # the age/tag tail ragged-edges down the column.
+    win = f"/{ctx_label(r['win']):<4}" if r.get("win") else " " * 5
+    when = "live" if r["age"] < CONTEXT_LIVE_MIN * 60 else fmt_age(r["age"])
+    tail = (" · " + " · ".join(r["tags"])) if r["tags"] else ""
+    emit(f"{ellipsis(r['label'], CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+         f"{render_bar(r['pct'] / 100, 6)} {round(r['pct']):>3}% "
+         f"{compact(r['tok']):>5}{win} · {when}{tail}",
+         color=adaptive(band_color(r["tier"])), size=CONTEXT_TEXT_SIZE,
+         sfimage=AGENT_ICON.get(r["prov"]))
+
+
+def emit_subagent_rows(kids, now_ts, cfg):
+    """A main session's running subagents, as sibling rows nested under it.
+
+    They stay in the main menu rather than becoming a submenu of the parent row: a
+    subagent burning context is exactly the thing you'd never think to hover for.
+    The turn-down arrow is an SF Symbol so these line up with the icon-bearing
+    parent rows — a text ↳ would sit in the monospace run and knock the bars out of
+    column."""
+    mode = cfg["context_window"]
+    for _ak, av in kids[:CONTEXT_MAX_AGENTS]:
+        win = context_window(av.get("model"), av.get("peak_ctx", 0), mode)
+        used = av.get("last_ctx", 0)
+        frac = used / win if win else 0.0
+        pct = min(100, max(0, round(frac * 100)))
+        age = now_ts - av.get("mtime", now_ts)
+        when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
+        aid = (av.get("agent_id") or "")[:4]
+        name = f"  {model_short(av.get('model'))}" + (f" {aid}" if aid else "")
+        tier, tags = ctx_tags(used, pct, win)
         tail = (" · " + " · ".join(tags)) if tags else ""
-        emit(f"{prov} · {ellipsis(label, 20)}  {render_bar(pct / 100, 6)} "
-             f"{compact(tok):>5} · {round(pct)}%{tail}",
-             color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
-    emit(ctx_risk_advice(worst), color=MUTED, size=CONTEXT_TEXT_SIZE)
+        emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+             f"{render_bar(frac, 6)} {pct:>3}% "
+             f"{compact(used):>5}/{ctx_label(win):<4} · {when}{tail}",
+             color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE,
+             sfimage=SUBAGENT_ICON)
+    if len(kids) > CONTEXT_MAX_AGENTS:
+        emit(f"  +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
+             size=CONTEXT_TEXT_SIZE, sfimage=SUBAGENT_ICON)
+
+
+def emit_agents(rows, by_parent, now_ts, cfg):
+    """The LIVE AGENTS section: what's running right now, worst context first,
+    with one advice line when anything is actually degrading."""
+    orphans = (by_parent or {}).get(None, [])
+    emit(f"LIVE AGENTS{' · ' + str(len(rows)) if rows else ''}",
+         color=MUTED, sfimage="gauge", header=True)
+    if not rows and not orphans:
+        emit("Nothing running", color=MUTED, size=CONTEXT_TEXT_SIZE)
+        sep()
+        return
+    for r in rows:
+        emit_agent_row(r)
+        if r["prov"] == "claude":
+            emit_subagent_rows((by_parent or {}).get(r["key"], []), now_ts, cfg)
+    if orphans:      # still running while their parent went idle or fell past the cap
+        emit_subagent_rows(orphans, now_ts, cfg)
+    at_risk = [r for r in rows if r["at_risk"]]
+    if at_risk:
+        worst = max(r["tier"] for r in at_risk)
+        emit(ctx_risk_advice(worst), color=adaptive(band_color(worst)),
+             size=CONTEXT_TEXT_SIZE, sfimage="exclamationmark.triangle.fill")
     sep()
 
 
@@ -1164,7 +1291,7 @@ def emit_live_limits(usage, now_epoch, tz):
     """The real, cross-surface limits from Anthropic (via the statusLine bridge)."""
     rl = usage["rate_limits"]
     plan = f" · {PLAN_LABEL[PLAN]}" if PLAN else ""
-    emit(f"USAGE LIMITS · live{plan}", color=MUTED, sfimage="bolt.fill", header=True)
+    emit(f"LIMITS · live{plan}", color=MUTED, sfimage="bolt.fill", header=True)
 
     estimated_any = []
 
@@ -1237,28 +1364,6 @@ def ctx_session_label(sv):
     return f"{proj} · {br}" if br and br not in ("main", "master", "HEAD") else proj
 
 
-def ctx_row(sv, now_ts, mode, agent=False):
-    """One agent's context-window fill, as a tree row: the (truncated) name leads
-    so subagents nest visibly under their parent; bar + numbers + freshness follow.
-    Sessions nearing the window get a ·full / ·rot tag so context rot stands out."""
-    win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
-    used = sv.get("last_ctx", 0)
-    frac = used / win if win else 0.0
-    pct = min(100, max(0, round(frac * 100)))
-    age = now_ts - sv.get("mtime", 0)
-    when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
-    if agent:
-        aid = (sv.get("agent_id") or "")[:4]
-        name = f"  ↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
-    else:
-        name = ctx_session_label(sv)
-    tier, tags = ctx_tags(used, pct, win)
-    tail = (" · " + " · ".join(tags)) if tags else ""
-    emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} {render_bar(frac, 6)} "
-         f"{pct:>3}% {compact(used):>5}/{ctx_label(win)} · {when}{tail}",
-         color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
-
-
 def live_session_cwds():
     """How many Claude Code CLI sessions are open, and in which working dirs.
 
@@ -1319,81 +1424,6 @@ def select_live_mains(cand, live_n, by_dir, now_ts):
     cut = now_ts - CONTEXT_ACTIVE_MIN * 60
     mains = [kv for kv in cand if kv[1].get("mtime", 0) >= cut]
     return mains[:live_n] if live_n else mains
-
-
-def emit_context(by_session, now, cfg):
-    """Per-agent context-window usage, so you can see at a glance how much room is
-    left in each running session. 'Agents' = the open main sessions (one per live
-    `claude` process) plus the subagents they're currently running."""
-    mode = cfg["context_window"]
-    now_ts = now.timestamp()
-
-    def norm(sv):
-        return os.path.normpath(sv.get("cwd") or "")
-
-    def agent_running(av):
-        # A subagent's parent session blocks while the subagent runs; once the
-        # parent writes again (the tool result) the subagent has finished — so it's
-        # live only until its parent's transcript passes it. Age is a backstop in
-        # case the parent was killed mid-run and never resumes.
-        if now_ts - av.get("mtime", 0) > CONTEXT_AGENT_MIN * 60:
-            return False
-        parent = by_session.get(av.get("sid"))
-        if parent and not parent.get("agent"):
-            return av.get("mtime", 0) >= parent.get("mtime", 0)
-        return True
-
-    # Cheap in-memory candidates first, so we only shell out to find live
-    # processes when there's actually something that could be shown.
-    cand = sorted((kv for kv in by_session.items()
-                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
-                  key=lambda kv: -kv[1]["mtime"])
-    agent_cand = sorted(((k, v) for k, v in by_session.items()
-                         if v.get("agent") and v.get("last_ctx", 0) > 0
-                         and agent_running(v)),
-                        key=lambda kv: -kv[1]["mtime"])
-    if not cand and not agent_cand:
-        return
-
-    live_n, by_dir = live_session_cwds()
-    mains = select_live_mains(cand, live_n, by_dir, now_ts)
-
-    # Subagents: still-running ones (parent hasn't resumed) in a live working dir
-    # (or, when we can't see dirs, just the still-running ones).
-    agents = [kv for kv in agent_cand if by_dir is None or norm(kv[1]) in by_dir]
-    if not mains and not agents:
-        return
-    by_parent = {}
-    for k, v in agents:
-        by_parent.setdefault(v.get("sid"), []).append((k, v))
-
-    emit("CONTEXT · live agents", color=MUTED, sfimage="gauge", header=True)
-
-    shown_agents = set()
-
-    def emit_agents(kids):
-        for ak, av in kids[:CONTEXT_MAX_AGENTS]:
-            ctx_row(av, now_ts, mode, agent=True)
-            shown_agents.add(ak)
-        if len(kids) > CONTEXT_MAX_AGENTS:
-            emit(f"  ↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
-                 size=CONTEXT_TEXT_SIZE)
-
-    # Hottest context first — context rot is the signal people watch for.
-    def fill_pct(sv):
-        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
-        used = sv.get("last_ctx", 0)
-        return (used / win) if win else 0.0
-
-    mains_sorted = sorted(mains[:CONTEXT_MAX_ROWS], key=lambda kv: -fill_pct(kv[1]))
-    for key, sv in mains_sorted:
-        ctx_row(sv, now_ts, mode)
-        emit_agents(by_parent.get(key, []))
-    # Subagents still running while their parent has gone idle (or fell past the cap).
-    orphans = [(k, v) for k, v in agents if k not in shown_agents]
-    if orphans:
-        emit_agents(orphans)
-    sep()
 
 
 # ─────────────────────── Cursor (offline) ───────────────────────
@@ -1497,62 +1527,6 @@ def live_cursor_procs():
     return n
 
 
-def emit_cursor_context_rows(ctx_rows, now_epoch):
-    """CONTEXT · live for Cursor — hottest (most full) first, Claude-style bars."""
-    emit("CONTEXT · live", color=MUTED, sfimage="gauge", header=True)
-    if not ctx_rows:
-        emit("No live context yet", color=MUTED)
-        emit("Wire Cursor statusLine via install.sh", sub=1, color=MUTED)
-        sep()
-        return
-    for _sid, entry, pct in ctx_rows[:CONTEXT_MAX_ROWS]:
-        age = now_epoch - (entry.get("captured_at") or now_epoch)
-        when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
-        name = cursor_session_label(entry)
-        model = entry.get("model") or ""
-        size = (entry.get("context_window") or {}).get("context_window_size")
-        tok = cursor_ctx_tokens(entry)
-        used_s = f" {compact(tok):>5}/{compact(size)}" if tok and size else ""
-        tier, tags = ctx_tags(tok, pct, size)
-        tail = (" · " + " · ".join(tags)) if tags else ""
-        emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
-             f"{render_bar(pct / 100, 6)} {round(pct):>3}%{used_s}"
-             f"{' · ' + model_short(model) if model else ''} · {when}{tail}",
-             color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
-    if len(ctx_rows) > CONTEXT_MAX_ROWS:
-        emit(f"+{len(ctx_rows) - CONTEXT_MAX_ROWS} more", color=MUTED,
-             size=CONTEXT_TEXT_SIZE)
-    sep()
-
-
-def emit_cursor_section(cdata, now_epoch, compact_view, ctx_rows=None):
-    """CURSOR provider block: context-rot gauges first, then session activity."""
-    emit("CURSOR", color=MUTED, sfimage="laptopcomputer", header=True)
-    if ctx_rows is None:
-        ctx_rows = fresh_cursor_sessions(cdata.get("session_map") or {}, now_epoch)
-    emit_cursor_context_rows(ctx_rows, now_epoch)
-
-    emit(f"Today       {cdata['today_turns']:>4} turns · "
-         f"{cdata['today_sessions']} sessions")
-    if not compact_view:
-        emit(f"All sessions{cdata['n_sessions']:>4}")
-        procs = live_cursor_procs()
-        if procs:
-            emit(f"Live procs  {procs:>4}")
-        emit("Recent")
-        for s in cdata["sessions"][:8]:
-            age = fmt_age(now_epoch - s["mtime"])
-            label = (s.get("title") or s["project"])[:22]
-            emit(f"{label:<22} {s['turns']:>3}t · {age}", sub=1)
-    else:
-        emit("Recent sessions")
-        for s in cdata["sessions"][:6]:
-            age = fmt_age(now_epoch - s["mtime"])
-            label = (s.get("title") or s["project"])[:22]
-            emit(f"{label:<22} {s['turns']:>3}t · {age}", sub=1)
-    sep()
-
-
 # ─────────────────────────── main ───────────────────────────
 def emit_menubar_title(cfg, usage, cursor_live, cursor_hottest, active_block,
                        cells, title_size, now_epoch):
@@ -1586,27 +1560,14 @@ def emit_menubar_title(cfg, usage, cursor_live, cursor_hottest, active_block,
           f"font={MONO} size={title_size} color={MUTED}")
 
 
-def emit_claude_section(cfg, usage, data, now, now_epoch, tz, today, compact_view):
-    """CLAUDE provider block: limits, context, today (+ more stats)."""
-    emit("CLAUDE", color=MUTED, sfimage="bolt.fill", header=True)
-
-    all_msgs = data["all_msgs"]
-    if all_msgs == 0 and not usage:
-        emit("No Claude Code usage found yet", color=MUTED)
-        sep()
-        return
-
+def claude_stats(data, now, tz, today):
+    """Everything the menu derives from the Claude transcript rollup, in one pass, so
+    TODAY and the Stats submenu can never disagree about what "today" means."""
     window = timedelta(hours=BLOCK_HOURS)
-    all_tok = data["all_tok"]
-    by_model_all, by_project = data["by_model"], data["by_project"]
-    by_session, hour_profile = data["by_session"], data["hour_profile"]
     by_day = {date.fromisoformat(k): v for k, v in data["by_day"].items()}
-    peak = data["peak"]
     blocks = build_blocks(sorted(data["recent_records"], key=lambda r: r["ts"]))
 
     month, week_start = today.replace(day=1), today - timedelta(days=6)
-    week_w = sum(v[0] for d, v in by_day.items() if d >= week_start)
-    month_w = sum(v[0] for d, v in by_day.items() if d >= month)
     today_tok, today_msgs, today_models = new_tokens(), 0, {}
     today_hours, today_sessions = [0.0] * 24, set()
     for r in data["recent_records"]:
@@ -1618,67 +1579,199 @@ def emit_claude_section(cfg, usage, data, now, now_epoch, tz, today, compact_vie
             today_sessions.add(r["session"])
 
     last = blocks[-1] if blocks else None
-    active = last if (last and now - last["start"] < window) else None
-    busiest_day = max(by_day.items(), key=lambda kv: kv[1][0]) if by_day else (today, [0.0, 0])
+    return {
+        "blocks": blocks, "by_day": by_day,
+        "active": last if (last and now - last["start"] < window) else None,
+        "week_w": sum(v[0] for d, v in by_day.items() if d >= week_start),
+        "month_w": sum(v[0] for d, v in by_day.items() if d >= month),
+        "today_tok": today_tok, "today_msgs": today_msgs,
+        "today_models": today_models, "today_hours": today_hours,
+        "today_sessions": today_sessions,
+        "busiest_day": (max(by_day.items(), key=lambda kv: kv[1][0])
+                        if by_day else (today, [0.0, 0])),
+    }
 
+
+def emit_limits(usage, now_epoch, tz):
+    """Anthropic's real cross-surface limits, or the one-time nudge to wire them up."""
     if usage:
-        # Context first — knowing you're about to rot matters more than the 5h clock
-        # when you're mid-session; limits follow.
-        emit_context(by_session, now, cfg)
         emit_live_limits(usage, now_epoch, tz)
-    else:
-        emit_context(by_session, now, cfg)
-        emit("USAGE LIMITS", color=MUTED, sfimage="bolt.fill", header=True)
-        emit("Live usage not set up", color=MUTED)
-        emit("Run install.sh to show real 5h / 7d limits", sub=1,
-             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
-        sep()
-
-    show_commits = cfg["commits"] == "on"
-    commits_today = 0
-    if show_commits:
-        author = cfg.get("commit_author") or git_identity()
-        dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
-        commits_today = count_commits_today(author, dirs or COMMIT_DIRS_DEFAULT)
-
-    emit("TODAY", color=MUTED, sfimage="calendar", header=True)
-    if compact_view:
-        commit_tag = ""
-        if show_commits:
-            commit_tag = (f" · 🔥{commits_today} commits" if commits_today
-                          else " · 📝0 commits")
-        emit(f"{compact(weighted(today_tok))} tok · {today_msgs} msgs · "
-             f"{len(today_sessions)} sessions{commit_tag}")
-        emit(f"By hour  {spark(today_hours)}")
-    else:
-        emit(f"Total       {compact(weighted(today_tok)):>8} tok")
-        emit(f"Messages    {today_msgs:>8}")
-        emit(f"Sessions    {len(today_sessions):>8}")
-        if show_commits:
-            emit(f"Commits     {commits_today:>8}")
-        if any(today_hours):
-            emit(f"Peak hour   {today_hours.index(max(today_hours)):02d}:00")
-        emit(f"By hour  {spark(today_hours)}")
-        emit("By model")
-        for m, mt in sorted(today_models.items(), key=lambda kv: -weighted(kv[1])):
-            emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
+        return
+    emit("LIMITS", color=MUTED, sfimage="bolt.fill", header=True)
+    emit("Live usage not set up", color=MUTED)
+    emit("Show real 5h / 7d limits", sub=1,
+         open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
     sep()
 
-    if compact_view:
-        emit("More stats", sfimage="chart.bar.fill")
-        emit(f"Week total   {compact(week_w):>8} tok", sub=1)
-        emit(f"Month total  {compact(month_w):>8} tok", sub=1)
-        emit(f"All-time     {compact(weighted(all_tok)):>8} tok", sub=1)
-        emit(f"Messages     {all_msgs:>8}", sub=1)
-        emit(f"Sessions     {len(by_session):>8}", sub=1)
-        emit(f"Peak block   {compact(peak['w']) if peak else '-':>8} tok", sub=1)
-        bd, (bw, _bm) = busiest_day
-        emit(f"Busiest day  {compact(bw):>8} tok", sub=1)
-        sep()
+
+def emit_today(cstats, cdata, commits, prov):
+    """One TODAY block covering every provider — each used to print its own."""
+    emit("TODAY", color=MUTED, sfimage="calendar", header=True)
+    if cstats:
+        emit(f"Claude  {compact(weighted(cstats['today_tok'])):>7} tok · "
+             f"{plural(cstats['today_msgs'], 'msg')} · "
+             f"{plural(len(cstats['today_sessions']), 'session')}")
+    elif prov["claude"]:
+        emit("Claude  no usage recorded yet", color=MUTED)
+    if cdata:
+        emit(f"Cursor  {cdata['today_turns']:>7} turns · "
+             f"{plural(cdata['today_sessions'], 'session')}")
+    if commits is not None:
+        emit(f"Commits {commits:>7}" + ("  \U0001f525" if commits else ""),
+             color=adaptive(TH["grad"][0]) if commits else None)
+    if cstats and any(cstats["today_hours"]):
+        emit(f"By hour {spark(cstats['today_hours'])}")
+    sep()
+
+
+def stats_submenu(data, cstats, cdata, today, tz, now_epoch):
+    """Everything that isn't "what's running right now", one level down.
+
+    This is the old Detailed view. It stopped being a mode you switch the whole
+    menu into and became a submenu you open: the deep stats are always there, and
+    the top level stays short whether or not you care about them."""
+    # A provider being *enabled* isn't the same as it having anything to show — on a
+    # fresh install cdata is a fully-populated dict of zeroes. Gate on real content,
+    # or the menu grows a Stats row leading to empty headers.
+    cursor_stats = cdata if (cdata and cdata.get("sessions")) else None
+    if not cstats and not cursor_stats:
+        return
+    emit("Stats", sfimage="chart.bar.fill")
+
+    if cstats:
+        by_day, blocks = cstats["by_day"], cstats["blocks"]
+        emit("LAST 7 DAYS", color=MUTED, sfimage="chart.bar.fill", header=True, sub=1)
+        days = sorted(by_day.items(), reverse=True)[:7]
+        daymax = max((v[0] for _, v in days), default=1) or 1
+        for d, (tok, _msgs) in days:
+            tag = "  ·today" if d == today else ""
+            emit(f"{d.strftime('%a %m-%d')} {render_bar(tok/daymax, 8)} "
+                 f"{compact(tok):>6}{tag}", sub=1)
+        emit(f"Week total  {compact(cstats['week_w']):>8} tok", sub=1)
+        emit(f"Month total {compact(cstats['month_w']):>8} tok", sub=1)
+        sep(1)
+
+        first_day = min(by_day) if by_day else today
+        span_days = (today - first_day).days + 1
+        all_tok, all_msgs = data["all_tok"], data["all_msgs"]
+        emit("ALL TIME", color=MUTED, sfimage="clock.arrow.circlepath",
+             header=True, sub=1)
+        if PLAN:
+            emit(f"Plan        {PLAN_LABEL[PLAN]:>8}", sub=1)
+        emit(f"Total       {compact(weighted(all_tok)):>8} tok", sub=1)
+        emit(f"Raw tokens  {compact(raw_total(all_tok)):>8}", sub=1)
+        emit(f"Messages    {all_msgs:>8}", sub=1)
+        emit(f"Sessions    {len(data['by_session']):>8}", sub=1)
+        emit(f"Projects    {len(data['by_project']):>8}", sub=1)
+        emit(f"Since       {first_day.strftime('%Y-%m-%d')} ({span_days}d)", sub=1)
+        emit(f"Daily avg   {compact(weighted(all_tok)/max(1, span_days)):>8} tok", sub=1)
+        emit(f"By hour  {spark(data['hour_profile'])}", sub=1)
+        sep(1)
+
+        emit("By model", sub=1)
+        for m, mt in sorted(data["by_model"].items(), key=lambda kv: -weighted(kv[1])):
+            emit(f"{m.replace('claude-', ''):<16}{compact(weighted(mt)):>8}", sub=2)
+        emit("By project", sub=1)
+        for p, pv in sorted(data["by_project"].items(),
+                            key=lambda kv: -weighted(kv[1]["t"]))[:12]:
+            emit(f"{p[:18]:<18}{compact(weighted(pv['t'])):>8}", sub=2)
+        emit("Top sessions", sub=1)
+        for _sid, sv in sorted(data["by_session"].items(),
+                               key=lambda kv: -weighted(kv[1]["t"]))[:8]:
+            when = (parse_ts(sv["last"]).astimezone(tz).strftime("%m-%d")
+                    if sv.get("last") else "  -  ")
+            emit(f"{sv['p'][:12]:<12} {when} {compact(weighted(sv['t'])):>7} "
+                 f"{sv['m']:>4}m", sub=2)
+        emit("Recent blocks", sub=1)
+        for b in list(reversed(blocks))[:10]:
+            s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
+            live = " (live)" if (b is blocks[-1] and cstats["active"]) else ""
+            emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
+                 sub=2, color=adaptive(TH["grad"][0]) if live else None)
+        sep(1)
+
+        emit("RECORDS", color=MUTED, sfimage="trophy.fill", header=True, sub=1)
+        peak = data["peak"]
+        if peak:
+            pb_when = parse_ts(peak["start"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+            emit(f"Peak block  {compact(peak['w']):>8} tok", sub=1)
+            emit(f"            {pb_when}", color=MUTED, sub=1)
+        bd, (bw, bm) = cstats["busiest_day"]
+        emit(f"Busiest day {compact(bw):>8} tok", sub=1)
+        emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED, sub=1)
+
+    if cursor_stats:
+        if cstats:
+            sep(1)
+        emit("CURSOR", color=MUTED, sfimage=AGENT_ICON["cursor"], header=True, sub=1)
+        emit(f"Sessions    {cursor_stats['n_sessions']:>8}", sub=1)
+        procs = live_cursor_procs()
+        if procs:
+            emit(f"Live procs  {procs:>8}", sub=1)
+        emit("Recent sessions", sub=1)
+        for s in cursor_stats["sessions"][:10]:
+            label = (s.get("title") or s["project"])[:22]
+            emit(f"{label:<22} {s['turns']:>3}t · {fmt_age(now_epoch - s['mtime'])}",
+                 sub=2)
+
+
+def settings_submenu(cfg):
+    """Every knob under one top-level row. These used to sit at the top level, one
+    row per group — over a third of the menu was settings you had already set."""
+    emit("Settings", sfimage="gearshape")
+
+    def mark(active):
+        # A checkmark on the selected row, blank (aligned) on the rest — cleaner
+        # than [x]/[ ] boxes. A native menu can't persistently highlight a row's
+        # background, so the checkmark is the selection cue.
+        return "✓ " if active else "  "
+
+    def group(title, key, options, image=None):
+        emit(title, sub=1)
+        for opt, lbl in options:
+            emit(f"{mark(str(cfg[key]) == str(opt))}{lbl}", sub=2,
+                 image=image(opt) if image else None, action=SELF,
+                 args=["--set", f"{key}={opt}"], refresh=True)
+
+    group("Providers", "providers",
+          (("auto", "Auto-detect"), ("claude", "Claude only"),
+           ("cursor", "Cursor only"), ("both", "Claude + Cursor")))
+    # Preview each theme by a PNG swatch of its gradient stops — the thing that
+    # actually differs between themes (their font colors are all near-white/black
+    # for readability, so they can't tell the themes apart on their own).
+    group("Theme", "theme", [(n, n.capitalize()) for n in THEMES],
+          image=lambda n: theme_swatch(THEMES[n]["grad"]))
+    group("Context window", "context_window",
+          (("auto", "Auto-detect"), ("200k", "200K"), ("1m", "1M")))
+    group("Menu-bar trailer", "menubar_extra",
+          (("countdown", "Reset countdown"), ("tokens", "Token count"),
+           ("none", "None")))
+    group("Menu-bar width", "menubar_cells", [(w, str(w)) for w in (3, 5, 8, 10)])
+    group("Commits today", "commits",
+          (("on", "On (your git commits)"), ("off", "Off")))
+    group("Check for updates", "update_check",
+          (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")))
+
+    sep(1)
+    # Live-usage status: connected once the statusLine bridge has written real data.
+    # Unset rows are clickable and lead straight to the setup docs.
+    if load_usage():
+        emit("Claude live · connected", sub=1, color=MUTED)
     else:
-        emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
-                           hour_profile, all_tok, all_msgs, today, tz,
-                           week_w, month_w, peak, busiest_day, active, now)
+        emit("Claude live · set up…", sub=1, color=adaptive(TH["grad"][1]),
+             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
+    if load_cursor_live():
+        emit("Cursor live · connected", sub=1, color=MUTED)
+    else:
+        emit("Cursor live · set up…", sub=1, color=adaptive(TH["grad"][1]),
+             open_path="https://github.com/dashpes/burnbar#cursor-cli")
+
+    sep(1)
+    emit("Open Claude transcripts", sub=1, sfimage="folder",
+         open_path=os.path.expanduser("~/.claude/projects"))
+    emit("Open Cursor projects", sub=1, sfimage="folder",
+         open_path=CURSOR_PROJECTS)
+    emit("Edit config file", sub=1, sfimage="doc.text", open_path=CONFIG_PATH)
 
 
 def main():
@@ -1687,9 +1780,6 @@ def main():
     TH = THEMES[cfg["theme"]]
     MUTED = TH["muted"]
     PLAN = read_plan()
-    cells = cfg["menubar_cells"]
-    title_size = cfg["title_size"]
-    compact_view = cfg["view"] == "compact"
     prov = active_providers(cfg)
 
     now = datetime.now(timezone.utc)
@@ -1701,196 +1791,43 @@ def main():
     usage = load_usage() if prov["claude"] else None
     data = gather(now, tz) if prov["claude"] else None
     cdata = gather_cursor(now, tz) if prov["cursor"] else None
-    cursor_live = (cdata or {}).get("live") if cdata else (
-        load_cursor_live() if prov["cursor"] else None)
-    cursor_rows = fresh_cursor_sessions(
-        (cdata or {}).get("session_map") or (
-            load_cursor_session_map() if prov["cursor"] else {}),
-        now_epoch) if prov["cursor"] else []
-    cursor_hottest = cursor_rows[0][2] if cursor_rows else None
+    cursor_rows = fresh_cursor_sessions((cdata or {}).get("session_map") or {},
+                                        now_epoch) if prov["cursor"] else []
 
-    # Active Claude block (for menubar token trailer)
-    active = None
-    if data and data["all_msgs"]:
-        blocks = build_blocks(sorted(data["recent_records"], key=lambda r: r["ts"]))
-        last = blocks[-1] if blocks else None
-        window = timedelta(hours=BLOCK_HOURS)
-        active = last if (last and now - last["start"] < window) else None
+    cstats = claude_stats(data, now, tz, today) if (data and data["all_msgs"]) else None
+    mains, by_parent = (claude_live_agents(data.get("by_session") or {}, now, cfg)
+                        if data else ([], {}))
+    agent_rows = unified_agent_rows(mains, cfg, cursor_rows, now_epoch)
 
-    emit_menubar_title(cfg, usage, cursor_live, cursor_hottest, active,
-                       cells, title_size, now_epoch)
+    emit_menubar_title(cfg, usage, (cdata or {}).get("live"),
+                       cursor_rows[0][2] if cursor_rows else None,
+                       cstats["active"] if cstats else None,
+                       cfg["menubar_cells"], cfg["title_size"], now_epoch)
     sep()
 
     if update_avail:
         emit_update(update_avail)
 
-    # Shared context-rot strip — above provider sections so it can't be missed.
-    claude_rows = []
-    if prov["claude"] and data:
-        claude_rows = claude_live_context_rows(data.get("by_session") or {}, now, cfg)
-    risks = collect_context_risks(claude_rows, cursor_rows)
-    emit_context_risk_strip(risks)
-
     if not prov["claude"] and not prov["cursor"]:
         emit("No CLI agents detected", color=MUTED)
         emit("Install Claude Code or Cursor CLI, then Refresh", color=MUTED)
         sep()
-    if prov["claude"]:
-        emit_claude_section(cfg, usage, data, now, now_epoch, tz, today, compact_view)
-    if prov["cursor"]:
-        emit_cursor_section(cdata or {
-            "sessions": [], "today_turns": 0, "today_sessions": 0,
-            "live": cursor_live, "session_map": {}, "n_sessions": 0},
-            now_epoch, compact_view, ctx_rows=cursor_rows)
+    else:
+        emit_agents(agent_rows, by_parent, now_epoch, cfg)
+        if prov["claude"]:
+            emit_limits(usage, now_epoch, tz)
+        commits = None
+        if cfg["commits"] == "on":
+            author = cfg.get("commit_author") or git_identity()
+            dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
+            commits = count_commits_today(author, dirs or COMMIT_DIRS_DEFAULT)
+        emit_today(cstats, cdata, commits, prov)
+        stats_submenu(data, cstats, cdata, today, tz, now_epoch)
+        settings_submenu(cfg)
 
-    settings_menu(cfg)
     sep()
     emit("Refresh", refresh=True, sfimage="arrow.clockwise")
-    if prov["claude"]:
-        emit("Open Claude transcripts", sfimage="folder",
-             open_path=os.path.expanduser("~/.claude/projects"))
-    if prov["cursor"]:
-        emit("Open Cursor projects", sfimage="folder",
-             open_path=CURSOR_PROJECTS)
     emit_version_footer(update_avail)
-
-
-def emit_full_sections(blocks, by_day, by_model_all, by_project, by_session,
-                       hour_profile, all_tok, all_msgs, today, tz,
-                       week_w, month_w, peak, busiest_day, active, now):
-    # LAST 7 DAYS
-    emit("LAST 7 DAYS", color=MUTED, sfimage="chart.bar.fill", header=True)
-    days = sorted(by_day.items(), reverse=True)[:7]
-    daymax = max((v[0] for _, v in days), default=1) or 1
-    for d, (tok, _msgs) in days:
-        tag = "  ·today" if d == today else ""
-        emit(f"{d.strftime('%a %m-%d')} {render_bar(tok/daymax, 8)} "
-             f"{compact(tok):>6}{tag}")
-    emit(f"Week total  {compact(week_w):>8} tok")
-    emit(f"Month total {compact(month_w):>8} tok")
-    sep()
-
-    # ALL TIME
-    first_day = min(by_day) if by_day else today
-    span_days = (today - first_day).days + 1
-    emit("ALL TIME", color=MUTED, sfimage="clock.arrow.circlepath", header=True)
-    if PLAN:
-        emit(f"Plan        {PLAN_LABEL[PLAN]:>8}")
-    emit(f"Total       {compact(weighted(all_tok)):>8} tok")
-    emit(f"Raw tokens  {compact(raw_total(all_tok)):>8}")
-    emit(f"Messages    {all_msgs:>8}")
-    emit(f"Sessions    {len(by_session):>8}")
-    emit(f"Projects    {len(by_project):>8}")
-    emit(f"Since       {first_day.strftime('%Y-%m-%d')} ({span_days}d)")
-    emit(f"Daily avg   {compact(weighted(all_tok)/max(1,span_days)):>8} tok")
-    emit(f"By hour  {spark(hour_profile)}")
-    emit("By model")
-    for m, mt in sorted(by_model_all.items(), key=lambda kv: -weighted(kv[1])):
-        emit(f"{m.replace('claude-',''):<16}{compact(weighted(mt)):>8}", sub=1)
-    emit("By project")
-    for p, pv in sorted(by_project.items(), key=lambda kv: -weighted(kv[1]["t"]))[:12]:
-        emit(f"{p[:18]:<18}{compact(weighted(pv['t'])):>8}", sub=1)
-    emit("Top sessions")
-    for _sid, sv in sorted(by_session.items(),
-                           key=lambda kv: -weighted(kv[1]["t"]))[:8]:
-        when = (parse_ts(sv["last"]).astimezone(tz).strftime("%m-%d")
-                if sv.get("last") else "  -  ")
-        emit(f"{sv['p'][:12]:<12} {when} {compact(weighted(sv['t'])):>7} "
-             f"{sv['m']:>4}m", sub=1)
-    sep()
-
-    # RECORDS
-    emit("RECORDS", color=MUTED, sfimage="trophy.fill", header=True)
-    if peak:
-        pb_when = parse_ts(peak["start"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
-        emit(f"Peak block  {compact(peak['w']):>8} tok")
-        emit(f"            {pb_when}", color=MUTED)
-    bd, (bw, bm) = busiest_day
-    emit(f"Busiest day {compact(bw):>8} tok")
-    emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED)
-    sep()
-
-    # RECENT BLOCKS
-    emit("Recent blocks")
-    for b in list(reversed(blocks))[:10]:
-        s = b["start"].astimezone(tz).strftime("%m-%d %H:%M")
-        live = " (live)" if (b is blocks[-1] and active is not None) else ""
-        emit(f"{s}  {compact(weighted(b['tokens'])):>7} · {b['msgs']:>3}m{live}",
-             sub=1, color=adaptive(TH["grad"][0]) if live else None)
-    sep()
-
-
-def settings_menu(cfg):
-    sep()
-    emit("Settings", color=MUTED, sfimage="gearshape", header=True)
-
-    def mark(active):
-        # A checkmark on the selected row, blank (aligned) on the rest — cleaner
-        # than [x]/[ ] boxes. A native menu can't persistently highlight a row's
-        # background, so the checkmark is the selection cue.
-        return "✓ " if active else "  "
-
-    emit("View")
-    emit(f"{mark(cfg['view']=='compact')}Compact", sub=1, action=SELF,
-         args=["--set", "view=compact"], refresh=True)
-    emit(f"{mark(cfg['view']=='detailed')}Detailed", sub=1, action=SELF,
-         args=["--set", "view=detailed"], refresh=True)
-
-    emit("Theme")
-    for name in THEMES:
-        # Preview each theme by a PNG swatch of its gradient stops — the thing that
-        # actually differs between themes (their font colors are all near-white/black
-        # for readability, so they can't tell the themes apart on their own).
-        emit(f"{mark(cfg['theme']==name)}{name.capitalize()}", sub=1,
-             image=theme_swatch(THEMES[name]["grad"]), action=SELF,
-             args=["--set", f"theme={name}"], refresh=True)
-
-    emit("Menu-bar trailer")
-    for opt, lbl in (("countdown", "Reset countdown"), ("tokens", "Token count"),
-                     ("none", "None")):
-        emit(f"{mark(cfg['menubar_extra']==opt)}{lbl}", sub=1, action=SELF,
-             args=["--set", f"menubar_extra={opt}"], refresh=True)
-
-    emit("Menu-bar width")
-    for w in (3, 5, 8, 10):
-        emit(f"{mark(cfg['menubar_cells']==w)}{w}", sub=1, action=SELF,
-             args=["--set", f"menubar_cells={w}"], refresh=True)
-
-    emit("Context window")
-    for opt, lbl in (("auto", "Auto-detect"), ("200k", "200K"), ("1m", "1M")):
-        emit(f"{mark(cfg['context_window']==opt)}{lbl}", sub=1, action=SELF,
-             args=["--set", f"context_window={opt}"], refresh=True)
-
-    emit("Check for updates")
-    for opt, lbl in (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")):
-        emit(f"{mark(cfg['update_check']==opt)}{lbl}", sub=1, action=SELF,
-             args=["--set", f"update_check={opt}"], refresh=True)
-
-    emit("Providers")
-    for opt, lbl in (("auto", "Auto-detect"), ("claude", "Claude only"),
-                     ("cursor", "Cursor only"), ("both", "Claude + Cursor")):
-        emit(f"{mark(cfg['providers']==opt)}{lbl}", sub=1, action=SELF,
-             args=["--set", f"providers={opt}"], refresh=True)
-
-    emit("Commits today")
-    for opt, lbl in (("on", "On (your git commits)"), ("off", "Off")):
-        emit(f"{mark(cfg['commits']==opt)}{lbl}", sub=1, action=SELF,
-             args=["--set", f"commits={opt}"], refresh=True)
-
-    # Live-usage status: on when the statusLine bridge has written real data.
-    if load_usage():
-        emit("Claude live  connected", color=MUTED)
-    else:
-        emit("Claude live  not set up", color=MUTED)
-        emit("Set up Claude live limits", sub=1,
-             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
-    if load_cursor_live():
-        emit("Cursor live  connected", color=MUTED)
-    else:
-        emit("Cursor live  not set up", color=MUTED)
-        emit("Set up Cursor statusLine (install.sh)", sub=1, color=MUTED)
-
-    emit("Edit config file", sub=0, open_path=CONFIG_PATH)
 
 
 if __name__ == "__main__":

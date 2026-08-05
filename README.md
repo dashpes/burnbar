@@ -19,49 +19,55 @@ version — it sends nothing about you, and it's one toggle away in Settings.)
 </p>
 
 <p align="center">
-  <img src="docs/screenshot-compact.png" alt="burnbar compact view" width="370">
+  <img src="docs/screenshot-compact.png" alt="burnbar dropdown" width="370">
   &nbsp;&nbsp;
-  <img src="docs/screenshot.png" alt="burnbar detailed view" width="370">
+  <img src="docs/screenshot.png" alt="burnbar Stats submenu" width="370">
 </p>
-<p align="center"><em>Compact view (left, the default) and Detailed view (right).</em></p>
+<p align="center"><em>The dropdown (left) and the Stats submenu (right).</em></p>
 
-Click it for a **Stats-style dropdown** with SF Symbol section headers:
+Click it for a dropdown that stays short — what's happening now at the top level,
+everything else one hover away:
 
-- **Claude** — live context windows for open sessions (hottest / at-risk first),
-  live 5-hour / 7-day / Opus limits, Today / 7-day / all-time token stats from
-  `~/.claude/projects/**/*.jsonl`
-- **Cursor** — live multi-session context fill (via statusLine bridge; sessions
-  ranked by context size so rot stands out), today's turn counts and recent
-  sessions from `~/.cursor`
-- **CONTEXT AT RISK** — top-of-menu strip tracking two *separate* risks:
-  **quality decay** (`drifting` / `degraded` / `rot`) and **compaction
-  proximity** on % of window (`near full` 70% · `compacting` 85%) — plus a line
-  on what to do about it
+- **LIVE AGENTS** — every running session from every provider in *one* list,
+  worst context first, each row tagged with its provider's SF Symbol (⚡ Claude,
+  ↖ Cursor). Subagents nest under the session that spawned them. Bar *length* is
+  window fill; bar *colour* is the rot band — they're independent signals and
+  they're meant to be able to disagree.
+- **LIMITS** — the real cross-surface 5-hour / 7-day / Opus limits from Anthropic
+  (via the statusLine bridge), with the reset countdown
+- **TODAY** — tokens, messages and sessions per provider, your git commit count,
+  and an hour-by-hour sparkline
+- **Stats** — 7-day and all-time totals, by model / project / session, recent
+  blocks, records, and Cursor session history
+- **Settings** — providers, theme, context window, menu-bar trailer & width,
+  commits, update check (no JSON editing)
 
-  Rot bands are token counts that scale with the window, sub-linearly:
+Two *separate* context risks drive the colours and the one-line advice under
+LIVE AGENTS: **quality decay** (`drifting` / `degraded` / `rot`) and
+**compaction proximity** on % of window (`near full` 70% · `compacting` 85%).
 
-  | window | drifting | degraded | rot |
-  |---|---|---|---|
-  | ≤200K | 32K | 60K | 128K |
-  | 1M | 100K | 200K | 400K |
+Rot bands are token counts that scale with the window, sub-linearly:
 
-  Neither raw percentage nor a flat token count works alone. Percentage hides
-  depth — a 1M session at 30% holds 300K tokens and is further gone than a 200K
-  one at 85%. But a flat threshold over-warns on big windows: a model built for
-  1M genuinely holds up past where a 200K one gives out. Hence a table.
+| window | drifting | degraded | rot |
+|---|---|---|---|
+| ≤200K | 32K | 60K | 128K |
+| 1M | 100K | 200K | 400K |
 
-  Calibration: [NoLiMa](https://arxiv.org/html/2502.05167v3) (11 of 13 models
-  claiming ≥128K fall below half their short-context baseline at 32K),
-  [RULER](https://arxiv.org/abs/2404.06654) (effective context ≈ 50–65% of
-  advertised), [Chroma's Context Rot](https://www.trychroma.com/research/context-rot)
-  (all 18 frontier models degrade before their limit; distractors compound it),
-  and reported multi-needle effective ranges of 200–400K for current 1M-class
-  flagships. Bands sit on the conservative side of those numbers because agentic
-  coding is multi-needle deep comprehension over a codebase full of near-miss
-  distractors — the hardest case, and harder than what most of these benchmarks
-  test. They're calibrated heuristics, not laws; tune `CTX_BAND_TABLE` to taste.
-- **Settings** — providers (auto / Claude / Cursor / both), view, theme,
-  menu-bar trailer & width (no JSON editing)
+Neither raw percentage nor a flat token count works alone. Percentage hides
+depth — a 1M session at 30% holds 300K tokens and is further gone than a 200K
+one at 85%. But a flat threshold over-warns on big windows: a model built for
+1M genuinely holds up past where a 200K one gives out. Hence a table.
+
+Calibration: [NoLiMa](https://arxiv.org/html/2502.05167v3) (11 of 13 models
+claiming ≥128K fall below half their short-context baseline at 32K),
+[RULER](https://arxiv.org/abs/2404.06654) (effective context ≈ 50–65% of
+advertised), [Chroma's Context Rot](https://www.trychroma.com/research/context-rot)
+(all 18 frontier models degrade before their limit; distractors compound it),
+and reported multi-needle effective ranges of 200–400K for current 1M-class
+flagships. Bands sit on the conservative side of those numbers because agentic
+coding is multi-needle deep comprehension over a codebase full of near-miss
+distractors — the hardest case, and harder than what most of these benchmarks
+test. They're calibrated heuristics, not laws; tune `CTX_BAND_TABLE` to taste.
 
 ## Install
 
@@ -138,11 +144,9 @@ The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 
 ## Settings (no JSON editing)
 
-Click the menu bar item → **Settings** to change things live; selections are
-marked with `[x]` and saved to `~/.config/burnbar/config.json`:
+Click the menu bar item → **Settings** to change things live; the selected option
+is checkmarked and saved to `~/.config/burnbar/config.json`:
 
-- **View** — `Compact` (default: just Today + a *More stats* submenu) or
-  `Detailed` (the full stats panel)
 - **Providers** — `Auto-detect` (default: show whichever CLIs are installed),
   `Claude only`, `Cursor only`, or `Claude + Cursor`
 - **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
@@ -150,8 +154,8 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 - **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
   `· 3h40m`), `Token count`, or `None`
 - **Menu-bar width** — bar cells: 3 / 5 / 8 / 10
-- **Context window** — how the *Context* section sizes each bar: `Auto-detect`,
-  `200K`, or `1M` (see below)
+- **Context window** — how *LIVE AGENTS* sizes each bar: `Auto-detect`, `200K`,
+  or `1M` (see below)
 - **Check for updates** — `Daily` (default; a version-only GET to GitHub, see
   [Updating](#updating)) or `Off` (no network calls at all)
 - **Commits today** — `On` (default) shows a count of *your* git commits made
