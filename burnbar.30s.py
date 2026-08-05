@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.6.1</bitbar.version>
+# <bitbar.version>1.7.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
-# <bitbar.desc>CLI agent usage (Claude Code + Cursor): live burn bar + stats dropdown.</bitbar.desc>
+# <bitbar.desc>AI coding agent usage: live burn bar + context-rot tracking + stats.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
 # <swiftbar.hideAbout>false</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideLastUpdated>false</swiftbar.hideLastUpdated>
 # <swiftbar.hideDisablePlugin>false</swiftbar.hideDisablePlugin>
 """
-burnbar — a SwiftBar/xbar plugin.
+burnbar — a SwiftBar/xbar plugin: one menu for every AI coding agent you run.
+
+Not a Claude Code tool that grew a Cursor tab. Providers are entries in the
+PROVIDERS registry below, and everything that varies per agent — detection,
+settings row, menu label, icon, live rows, today line — reads from that entry.
+Adding an agent is a table entry plus its own gather/rows functions; no existing
+function grows another branch.
 
 Menu bar:  a live progress bar for your current usage (Claude rate limits when
            available, else Cursor context fill).
@@ -25,7 +31,9 @@ items in the Settings submenu (which re-invoke this script with --set).
 """
 
 import base64
+import contextlib
 import glob
+import io
 import json
 import os
 import re
@@ -141,13 +149,11 @@ MONO = "Menlo"
 # colour — colour is already spoken for by the rot band, and one channel can't
 # encode two independent signals. The SF Symbol also sits outside the monospace
 # run, so the bars stay column-aligned however wide the icon renders.
-AGENT_ICON = {"claude": "bolt.fill", "cursor": "cursorarrow"}
+# Provider identity is spelled out on every row (AGENT_LABEL, derived from the
+# PROVIDERS registry). An icon alone can't carry it: a monochrome glyph tinted to
+# the row's rot colour reads as decoration, and when every visible row is the same
+# provider there's no contrast to decode it against.
 SUBAGENT_ICON = "arrow.turn.down.right"   # subagents nest under their parent row
-# ...but the icon alone doesn't carry it. A monochrome glyph tinted to the row's rot
-# colour reads as decoration, not identity — especially when every visible row
-# happens to be the same provider, so there's no contrast to decode it against. The
-# name is spelled out; the icon just reinforces it.
-AGENT_LABEL = {"claude": "Claude", "cursor": "Cursor"}
 
 # ── commits-today tracking ──
 # Default folders scanned for git repos when "commit_dirs" isn't set in config.
@@ -189,11 +195,12 @@ DEFAULTS = {
     "commits": "on",             # show today's git commit count in TODAY: on | off
     "commit_author": "",         # whose commits to count; "" = your git identity
     "commit_dirs": [],           # folders to scan for repos; [] = sensible defaults
-    "providers": "auto",         # auto | claude | cursor | both
+    "providers_mode": "auto",    # auto (show whatever is installed) | manual
+    # Per-provider "on"/"off" keys (provider_claude, …) are added to DEFAULTS from
+    # the PROVIDERS registry once it's defined, so a new agent needs no edit here.
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 CONTEXT_WINDOWS = ("auto", "200k", "1m")
-PROVIDERS = ("auto", "claude", "cursor", "both")
 
 # ── themes: a full palette, so the whole dropdown gets tinted ──
 #   grad  = (low, mid, high, max) bar gradient + alert accents (by % burn)
@@ -270,8 +277,7 @@ def load_config():
         cfg["update_check"] = "on"
     if cfg.get("commits") not in ("on", "off"):
         cfg["commits"] = "on"
-    if cfg.get("providers") not in PROVIDERS:
-        cfg["providers"] = "auto"
+    migrate_providers(cfg)
     try:
         cfg["menubar_cells"] = max(3, min(12, int(cfg.get("menubar_cells", 5))))
     except Exception:
@@ -765,29 +771,43 @@ def collect_context_risks(claude_rows, cursor_rows, warn=CONTEXT_WARN_PCT):
     return risks
 
 
-def unified_agent_rows(mains, cfg, cursor_rows, now_epoch):
-    """Every live agent, from every provider, in one list — worst context first.
-
-    burnbar used to print this three times over (a top-of-menu risk strip, then
-    again inside each provider's own section). One list, ranked the way the risk
-    itself ranks — rot tier, then absolute tokens, then window fill — says the same
-    thing once. Provider comes back as a per-row icon (see AGENT_ICON)."""
+def claude_agent_rows(pdata, cfg, now_epoch):
+    """Claude's contribution to the agent list: one row per live main session."""
     mode = cfg["context_window"]
     rows = []
-    for key, sv in mains:
+    for key, sv in (pdata or {}).get("mains", []):
         win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
         used = sv.get("last_ctx", 0)
         rows.append({"prov": "claude", "key": key, "label": ctx_session_label(sv),
                      "tok": used, "win": win,
                      "pct": min(100.0, 100.0 * used / win) if win else 0.0,
                      "age": now_epoch - sv.get("mtime", now_epoch)})
-    for sid, entry, pct in (cursor_rows or [])[:CONTEXT_MAX_ROWS]:
+    return rows
+
+
+def cursor_agent_rows(pdata, cfg, now_epoch):
+    """Cursor's contribution: live context fill per session, from the bridge."""
+    del cfg                      # Cursor reports its own window size
+    rows = []
+    for sid, entry, pct in ((pdata or {}).get("ctx_rows") or [])[:CONTEXT_MAX_ROWS]:
         cw = entry.get("context_window") or {}
         rows.append({"prov": "cursor", "key": sid,
                      "label": cursor_session_label(entry),
                      "tok": cursor_ctx_tokens(entry) or 0,
                      "win": cw.get("context_window_size"), "pct": pct,
                      "age": now_epoch - (entry.get("captured_at") or now_epoch)})
+    return rows
+
+
+def unified_agent_rows(rows):
+    """Band and rank every provider's rows into one list — worst context first.
+
+    burnbar used to print this three times over (a top-of-menu risk strip, then
+    again inside each provider's own section). One list, ranked the way the risk
+    itself ranks — rot tier, then absolute tokens, then window fill — says the
+    same thing once, and a new provider joins it by returning rows of the same
+    shape rather than earning a section of its own."""
+    rows = list(rows)
     for r in rows:
         r["tier"], r["tags"] = ctx_tags(r["tok"], r["pct"], r["win"])
         r["at_risk"] = r["tier"] >= CTX_RISK_TIER or r["pct"] >= CONTEXT_WARN_PCT
@@ -892,16 +912,89 @@ def detect_cursor():
                 or os.path.isdir(CURSOR_PROJECTS) or os.path.isdir(CURSOR_CHATS))
 
 
+# ─────────────────────── the provider registry ───────────────────────
+# One entry per AI coding agent. Everything that varies per agent lives here, so
+# adding one is an entry plus the functions it names — not a new branch in
+# active_providers, the settings menu, the agent list and the today block.
+#
+#   key      config/registry id, and the key active_providers() returns
+#   label    what the menu calls it (spelled out on every agent row)
+#   icon     SF Symbol; reinforces the label, and marks the row's provider
+#   detect   () -> bool: is this agent installed on this machine?
+#   gather   (now, tz, now_epoch) -> provider data, or None. Handed back to the
+#            hooks below; burnbar never looks inside it.
+#   rows     (pdata, cfg, now_epoch) -> [raw agent row], one per live session.
+#            Raw = {prov, key, label, tok, win, pct, age}; banding, ranking and
+#            rendering are shared (see unified_agent_rows).
+#   today    (pdata) -> str, the provider's line in TODAY, or None
+#   stats    (pdata, now_epoch) -> None, optional; emits into the Stats submenu
+#   setup    docs anchor for the "not set up" nudge in Settings
+#
+# Order here is display order for ties and for the settings list.
+PROVIDERS = (
+    {"key": "claude", "label": "Claude", "icon": "bolt.fill",
+     "detect": lambda: detect_claude(),
+     "gather": lambda now, tz, now_epoch: gather_claude(now, tz),
+     "rows": lambda pdata, cfg, now_epoch: claude_agent_rows(pdata, cfg, now_epoch),
+     "today": lambda pdata: claude_today_line(pdata),
+     "stats": None,          # Claude's stats block is emitted inline (it's the big one)
+     "setup": "#live-usage-real-limits-not-estimates"},
+    {"key": "cursor", "label": "Cursor", "icon": "cursorarrow",
+     "detect": lambda: detect_cursor(),
+     "gather": lambda now, tz, now_epoch: gather_cursor(now, tz),
+     "rows": lambda pdata, cfg, now_epoch: cursor_agent_rows(pdata, cfg, now_epoch),
+     "today": lambda pdata: cursor_today_line(pdata),
+     "stats": lambda pdata, now_epoch: emit_cursor_stats(pdata, now_epoch),
+     "setup": "#cursor-cli"},
+)
+# "Is this agent's statusLine bridge wired up?" — separate from the table so the
+# table stays a plain description of each agent.
+BRIDGE_CONNECTED = {"claude": lambda: bool(load_usage()),
+                    "cursor": lambda: bool(load_cursor_live())}
+PROVIDER_KEYS = tuple(p["key"] for p in PROVIDERS)
+PROVIDER_BY_KEY = {p["key"]: p for p in PROVIDERS}
+# Provider identity on an agent row is carried by the spelled-out label; the icon
+# reinforces it. Both are derived so a new provider needs no edit here either.
+AGENT_LABEL = {p["key"]: p["label"] for p in PROVIDERS}
+AGENT_ICON = {p["key"]: p["icon"] for p in PROVIDERS}
+# Per-provider visibility keys, defaulted on (they only apply in manual mode).
+for _p in PROVIDERS:
+    DEFAULTS[f"provider_{_p['key']}"] = "on"
+
+# Values the pre-1.7 single "providers" key could hold, and what each meant. Kept
+# so an existing config keeps behaving the same after the upgrade.
+LEGACY_PROVIDERS = {
+    "auto": None,                                   # -> auto mode, nothing pinned
+    "claude": {"claude": "on", "cursor": "off"},
+    "cursor": {"claude": "off", "cursor": "on"},
+    "both": {"claude": "on", "cursor": "on"},
+}
+
+
+def migrate_providers(cfg):
+    """Normalise provider settings, converting the pre-1.7 `providers` enum.
+
+    That key was a fixed enum (auto/claude/cursor/both) — it could not express a
+    third agent, which is what forced this registry. Translate it once and drop
+    it; per-provider keys scale to as many agents as we add."""
+    legacy = cfg.pop("providers", None)
+    if isinstance(legacy, str) and legacy in LEGACY_PROVIDERS:
+        pins = LEGACY_PROVIDERS[legacy]
+        cfg["providers_mode"] = "manual" if pins else "auto"
+        for key, val in (pins or {}).items():
+            cfg[f"provider_{key}"] = val
+    if cfg.get("providers_mode") not in ("auto", "manual"):
+        cfg["providers_mode"] = "auto"
+    for key in PROVIDER_KEYS:
+        if cfg.get(f"provider_{key}") not in ("on", "off"):
+            cfg[f"provider_{key}"] = "on"
+
+
 def active_providers(cfg):
-    """Which provider sections to show, from config + auto-detection."""
-    mode = cfg.get("providers") or "auto"
-    if mode == "claude":
-        return {"claude": True, "cursor": False}
-    if mode == "cursor":
-        return {"claude": False, "cursor": True}
-    if mode == "both":
-        return {"claude": True, "cursor": True}
-    return {"claude": detect_claude(), "cursor": detect_cursor()}
+    """Which agents to show: everything installed, or exactly what you've pinned."""
+    if cfg.get("providers_mode") == "manual":
+        return {k: cfg.get(f"provider_{k}") == "on" for k in PROVIDER_KEYS}
+    return {p["key"]: bool(p["detect"]()) for p in PROVIDERS}
 
 
 # ─────────────────────────── update check ───────────────────────────
@@ -1633,6 +1726,8 @@ def gather_cursor(now, tz):
         "live": live,
         "session_map": session_map,
         "n_sessions": len(sessions),
+        # Live context fill per open session — what the agent list is built from.
+        "ctx_rows": fresh_cursor_sessions(session_map, datetime.now(tz).timestamp()),
     }
 
 
@@ -1714,6 +1809,47 @@ def claude_stats(data, now, tz, today):
     }
 
 
+def gather_claude(now, tz):
+    """Claude's bundle: transcript rollup, live limits, and which sessions are open."""
+    usage = load_usage()
+    data = gather(now, tz)
+    mains, by_parent = claude_live_agents(data.get("by_session") or {}, now,
+                                          load_config())
+    return {"data": data, "usage": usage, "mains": mains, "by_parent": by_parent}
+
+
+def claude_today_line(pdata):
+    cstats = (pdata or {}).get("stats")
+    if not cstats:
+        return "no usage recorded yet"
+    return (f"{compact(weighted(cstats['today_tok'])):>7} tok · "
+            f"{plural(cstats['today_msgs'], 'msg')} · "
+            f"{plural(len(cstats['today_sessions']), 'session')}")
+
+
+def cursor_today_line(pdata):
+    if not pdata:
+        return None
+    return (f"{pdata['today_turns']:>7} turns · "
+            f"{plural(pdata['today_sessions'], 'session')}")
+
+
+def emit_cursor_stats(pdata, now_epoch):
+    """Cursor's block in the Stats submenu. Silent when there's nothing to show."""
+    if not (pdata and pdata.get("sessions")):
+        return
+    emit("CURSOR", color=MUTED, sfimage=AGENT_ICON["cursor"], header=True, sub=1)
+    emit(f"Sessions    {pdata['n_sessions']:>8}", sub=1)
+    procs = live_cursor_procs()
+    if procs:
+        emit(f"Live procs  {procs:>8}", sub=1)
+    emit("Recent sessions", sub=1)
+    for sess in pdata["sessions"][:10]:
+        label = (sess.get("title") or sess["project"])[:22]
+        emit(f"{label:<22} {sess['turns']:>3}t · "
+             f"{fmt_age(now_epoch - sess['mtime'])}", sub=2)
+
+
 def emit_limits(usage, now_epoch, tz):
     """Anthropic's real cross-surface limits, or the one-time nudge to wire them up."""
     if usage:
@@ -1726,37 +1862,54 @@ def emit_limits(usage, now_epoch, tz):
     sep()
 
 
-def emit_today(cstats, cdata, commits, prov):
+def emit_today(bundles, commits, prov):
     """One TODAY block covering every provider — each used to print its own."""
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
-    if cstats:
-        emit(f"Claude  {compact(weighted(cstats['today_tok'])):>7} tok · "
-             f"{plural(cstats['today_msgs'], 'msg')} · "
-             f"{plural(len(cstats['today_sessions']), 'session')}")
-    elif prov["claude"]:
-        emit("Claude  no usage recorded yet", color=MUTED)
-    if cdata:
-        emit(f"Cursor  {cdata['today_turns']:>7} turns · "
-             f"{plural(cdata['today_sessions'], 'session')}")
+    width = max(len(p["label"]) for p in PROVIDERS)
+    for p in PROVIDERS:
+        if not prov.get(p["key"]):
+            continue
+        line = p["today"](bundles.get(p["key"]))
+        if line:
+            emit(f"{p['label']:<{width}}  {line}",
+                 color=MUTED if "no usage" in line else None)
     if commits is not None:
-        emit(f"Commits {commits:>7}" + ("  \U0001f525" if commits else ""),
+        emit(f"{'Commits':<{width}}  {commits:>7}" + ("  \U0001f525" if commits else ""),
              color=adaptive(TH["grad"][0]) if commits else None)
+    cstats = (bundles.get("claude") or {}).get("stats")
     if cstats and any(cstats["today_hours"]):
-        emit(f"By hour {spark(cstats['today_hours'])}")
+        emit(f"{'By hour':<{width}}  {spark(cstats['today_hours'])}")
     sep()
 
 
-def stats_submenu(data, cstats, cdata, today, tz, now_epoch):
+def provider_stat_blocks(bundles, now_epoch):
+    """Each provider's Stats section, pre-rendered, skipping the ones with nothing.
+
+    Whether a provider has anything to say is only known by emitting it — the hook
+    decides what to skip — so render into a buffer and keep the non-empty ones.
+    That way the Stats row only appears when opening it would show something."""
+    blocks = []
+    for p in PROVIDERS:
+        if not p["stats"]:
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            p["stats"](bundles.get(p["key"]), now_epoch)
+        if buf.getvalue().strip():
+            blocks.append(buf.getvalue())
+    return blocks
+
+
+def stats_submenu(data, cstats, bundles, today, tz, now_epoch):
     """Everything that isn't "what's running right now", one level down.
 
     This is the old Detailed view. It stopped being a mode you switch the whole
     menu into and became a submenu you open: the deep stats are always there, and
     the top level stays short whether or not you care about them."""
     # A provider being *enabled* isn't the same as it having anything to show — on a
-    # fresh install cdata is a fully-populated dict of zeroes. Gate on real content,
-    # or the menu grows a Stats row leading to empty headers.
-    cursor_stats = cdata if (cdata and cdata.get("sessions")) else None
-    if not cstats and not cursor_stats:
+    # fresh install a bundle is a fully-populated dict of zeroes.
+    provider_blocks = provider_stat_blocks(bundles, now_epoch)
+    if not cstats and not provider_blocks:
         return
     emit("Stats", sfimage="chart.bar.fill")
 
@@ -1822,22 +1975,15 @@ def stats_submenu(data, cstats, cdata, today, tz, now_epoch):
         emit(f"Busiest day {compact(bw):>8} tok", sub=1)
         emit(f"            {bd.strftime('%Y-%m-%d')} · {bm} msgs", color=MUTED, sub=1)
 
-    if cursor_stats:
-        if cstats:
+    printed = bool(cstats)
+    for block in provider_blocks:
+        if printed:
             sep(1)
-        emit("CURSOR", color=MUTED, sfimage=AGENT_ICON["cursor"], header=True, sub=1)
-        emit(f"Sessions    {cursor_stats['n_sessions']:>8}", sub=1)
-        procs = live_cursor_procs()
-        if procs:
-            emit(f"Live procs  {procs:>8}", sub=1)
-        emit("Recent sessions", sub=1)
-        for s in cursor_stats["sessions"][:10]:
-            label = (s.get("title") or s["project"])[:22]
-            emit(f"{label:<22} {s['turns']:>3}t · {fmt_age(now_epoch - s['mtime'])}",
-                 sub=2)
+        sys.stdout.write(block)
+        printed = True
 
 
-def settings_submenu(cfg):
+def settings_submenu(cfg, prov):
     """Every knob under one top-level row. These used to sit at the top level, one
     row per group — over a third of the menu was settings you had already set."""
     emit("Settings", sfimage="gearshape")
@@ -1855,9 +2001,25 @@ def settings_submenu(cfg):
                  image=image(opt) if image else None, action=SELF,
                  args=["--set", f"{key}={opt}"], refresh=True)
 
-    group("Providers", "providers",
-          (("auto", "Auto-detect"), ("claude", "Claude only"),
-           ("cursor", "Cursor only"), ("both", "Claude + Cursor")))
+    # Providers are checkboxes, not a fixed enum: the enum could name every
+    # combination of two agents, but not of five. Auto-detect is the master;
+    # clicking any agent pins the current set and flips that one, so switching to
+    # manual can never silently switch on an agent you don't have.
+    auto = cfg.get("providers_mode") != "manual"
+    emit("Providers", sub=1)
+    emit(f"{mark(auto)}Auto-detect installed agents", sub=2, action=SELF,
+         args=["--set", "providers_mode=auto"], refresh=True)
+    sep(2)
+    for p in PROVIDERS:
+        on = bool(prov.get(p["key"]))
+        pins = ["--set", "providers_mode=manual"]
+        for q in PROVIDERS:
+            state = bool(prov.get(q["key"]))
+            if q["key"] == p["key"]:
+                state = not state
+            pins.append(f"provider_{q['key']}={'on' if state else 'off'}")
+        emit(f"{mark(on)}{p['label']}", sub=2, sfimage=p["icon"],
+             action=SELF, args=pins, refresh=True)
     # Preview each theme by a PNG swatch of its gradient stops — the thing that
     # actually differs between themes (their font colors are all near-white/black
     # for readability, so they can't tell the themes apart on their own).
@@ -1875,18 +2037,16 @@ def settings_submenu(cfg):
           (("on", "Daily (a version-only GET to GitHub)"), ("off", "Off")))
 
     sep(1)
-    # Live-usage status: connected once the statusLine bridge has written real data.
-    # Unset rows are clickable and lead straight to the setup docs.
-    if load_usage():
-        emit("Claude live · connected", sub=1, color=MUTED)
-    else:
-        emit("Claude live · set up…", sub=1, color=adaptive(TH["grad"][1]),
-             open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
-    if load_cursor_live():
-        emit("Cursor live · connected", sub=1, color=MUTED)
-    else:
-        emit("Cursor live · set up…", sub=1, color=adaptive(TH["grad"][1]),
-             open_path="https://github.com/dashpes/burnbar#cursor-cli")
+    # Bridge status, one row per agent: connected once its statusLine hook has
+    # written real data. Unset rows are clickable and lead to the setup docs.
+    for p in PROVIDERS:
+        wired = BRIDGE_CONNECTED.get(p["key"], lambda: False)()
+        if wired:
+            emit(f"{p['label']} live · connected", sub=1, color=MUTED)
+        else:
+            emit(f"{p['label']} live · set up…", sub=1,
+                 color=adaptive(TH["grad"][1]),
+                 open_path=f"https://github.com/dashpes/burnbar{p['setup']}")
 
     sep(1)
     emit("Open Claude transcripts", sub=1, sfimage="folder",
@@ -1910,18 +2070,25 @@ def main():
     tz = datetime.now().astimezone().tzinfo
     today = datetime.now().astimezone(tz).date()
 
-    usage = load_usage() if prov["claude"] else None
-    data = gather(now, tz) if prov["claude"] else None
-    cdata = gather_cursor(now, tz) if prov["cursor"] else None
-    cursor_rows = fresh_cursor_sessions((cdata or {}).get("session_map") or {},
-                                        now_epoch) if prov["cursor"] else []
+    # Every active provider gathers into its own opaque bundle, then contributes
+    # rows to the shared agent list. Nothing in this loop names a specific agent.
+    bundles, raw_rows = {}, []
+    for p in PROVIDERS:
+        if not prov.get(p["key"]):
+            continue
+        bundles[p["key"]] = p["gather"](now, tz, now_epoch)
+        raw_rows.extend(p["rows"](bundles[p["key"]], cfg, now_epoch) or [])
+    agent_rows = unified_agent_rows(raw_rows)
 
+    # Claude keeps two things the generic pipeline doesn't model: real plan limits,
+    # and the deep stats panel. Both are opt-in extras, not part of the interface.
+    claude = bundles.get("claude") or {}
+    data, usage = claude.get("data"), claude.get("usage")
     cstats = claude_stats(data, now, tz, today) if (data and data["all_msgs"]) else None
-    mains, by_parent = (claude_live_agents(data.get("by_session") or {}, now, cfg)
-                        if data else ([], {}))
-    agent_rows = unified_agent_rows(mains, cfg, cursor_rows, now_epoch)
+    claude["stats"] = cstats
 
-    emit_menubar_title(cfg, usage, (cdata or {}).get("live"),
+    cursor_rows = (bundles.get("cursor") or {}).get("ctx_rows") or []
+    emit_menubar_title(cfg, usage, (bundles.get("cursor") or {}).get("live"),
                        cursor_rows[0][2] if cursor_rows else None,
                        cstats["active"] if cstats else None,
                        cfg["menubar_cells"], cfg["title_size"], now_epoch)
@@ -1930,23 +2097,23 @@ def main():
     if update_avail:
         emit_update(update_avail)
 
-    if not prov["claude"] and not prov["cursor"]:
-        emit("No CLI agents detected", color=MUTED)
-        emit("Install Claude Code or Cursor CLI, then Refresh", color=MUTED)
+    if not any(prov.values()):
+        emit("No AI coding agents detected", color=MUTED)
+        emit("Install one, then Refresh", color=MUTED)
         sep()
     else:
-        emit_agents(agent_rows, by_parent, now_epoch, cfg)
-        if prov["claude"]:
+        emit_agents(agent_rows, claude.get("by_parent") or {}, now_epoch, cfg)
+        if prov.get("claude"):
             emit_limits(usage, now_epoch, tz)
         commits = None
         if cfg["commits"] == "on":
             author = cfg.get("commit_author") or git_identity()
-            dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
+            dirs = [os.path.expanduser(pth) for pth in (cfg.get("commit_dirs") or [])]
             commits = commits_today(author, dirs or COMMIT_DIRS_DEFAULT,
                                     now_epoch, today.isoformat())
-        emit_today(cstats, cdata, commits, prov)
-        stats_submenu(data, cstats, cdata, today, tz, now_epoch)
-        settings_submenu(cfg)
+        emit_today(bundles, commits, prov)
+        stats_submenu(data, cstats, bundles, today, tz, now_epoch)
+        settings_submenu(cfg, prov)
 
     sep()
     emit("Refresh", refresh=True, sfimage="arrow.clockwise")

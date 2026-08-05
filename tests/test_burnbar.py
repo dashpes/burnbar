@@ -221,18 +221,23 @@ class TestLimitView(unittest.TestCase):
 
 
 class TestProviders(unittest.TestCase):
+    def cfg(self, legacy):
+        c = dict(bb.DEFAULTS, providers=legacy)
+        bb.migrate_providers(c)
+        return c
+
     def test_active_providers_modes(self):
-        self.assertEqual(bb.active_providers({"providers": "claude"}),
+        self.assertEqual(bb.active_providers(self.cfg("claude")),
                          {"claude": True, "cursor": False})
-        self.assertEqual(bb.active_providers({"providers": "cursor"}),
+        self.assertEqual(bb.active_providers(self.cfg("cursor")),
                          {"claude": False, "cursor": True})
-        self.assertEqual(bb.active_providers({"providers": "both"}),
+        self.assertEqual(bb.active_providers(self.cfg("both")),
                          {"claude": True, "cursor": True})
 
     def test_auto_uses_detect(self):
         with mock.patch.object(bb, "detect_claude", return_value=True), \
              mock.patch.object(bb, "detect_cursor", return_value=False):
-            self.assertEqual(bb.active_providers({"providers": "auto"}),
+            self.assertEqual(bb.active_providers(self.cfg("auto")),
                              {"claude": True, "cursor": False})
 
     def test_cursor_project_slug(self):
@@ -340,8 +345,10 @@ class TestUnifiedAgentRows(unittest.TestCase):
     NOW = 1_000_000
 
     def rows(self, mains=(), cursor=()):
-        return bb.unified_agent_rows(list(mains), dict(bb.DEFAULTS), list(cursor),
-                                     self.NOW)
+        cfg = dict(bb.DEFAULTS)
+        return bb.unified_agent_rows(
+            bb.claude_agent_rows({"mains": list(mains)}, cfg, self.NOW)
+            + bb.cursor_agent_rows({"ctx_rows": list(cursor)}, cfg, self.NOW))
 
     def cursor_entry(self, name, pct, size=256_000, age=60):
         return (name, {"session_name": name, "captured_at": self.NOW - age,
@@ -553,7 +560,9 @@ class TestMenuRendering(unittest.TestCase):
         cursor = [("c1", {"session_name": "Hot", "captured_at": self.NOW,
                           "context_window": {"used_percentage": 20,
                                              "context_window_size": 256_000}}, 20.0)]
-        rows = bb.unified_agent_rows(mains, cfg, cursor, self.NOW)
+        rows = bb.unified_agent_rows(
+            bb.claude_agent_rows({"mains": mains}, cfg, self.NOW)
+            + bb.cursor_agent_rows({"ctx_rows": cursor}, cfg, self.NOW))
         out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
         self.assertIn(f"sfimage={bb.AGENT_ICON['claude']}", out)
         self.assertIn(f"sfimage={bb.AGENT_ICON['cursor']}", out)
@@ -565,7 +574,8 @@ class TestMenuRendering(unittest.TestCase):
         cfg = dict(bb.DEFAULTS)
         mains = [("s1", {"model": "claude-sonnet-5", "last_ctx": 5_000,
                          "peak_ctx": 5_000, "mtime": self.NOW, "title": "Calm"})]
-        rows = bb.unified_agent_rows(mains, cfg, [], self.NOW)
+        rows = bb.unified_agent_rows(bb.claude_agent_rows({"mains": mains}, cfg,
+                                                          self.NOW))
         out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
         self.assertIn("LIVE AGENTS · 1", out)
         self.assertNotIn("/compact", out)
@@ -580,7 +590,8 @@ class TestMenuRendering(unittest.TestCase):
         kids = {"p": [("a", {"model": "claude-haiku-4-5", "last_ctx": 2_000,
                              "peak_ctx": 2_000, "mtime": self.NOW,
                              "agent_id": "aaaa"})]}
-        rows = bb.unified_agent_rows(mains, cfg, [], self.NOW)
+        rows = bb.unified_agent_rows(bb.claude_agent_rows({"mains": mains}, cfg,
+                                                          self.NOW))
         out = self.render(bb.emit_agents, rows, kids, self.NOW, cfg)
         kid_line = [ln for ln in out.splitlines() if "haiku" in ln][0]
         self.assertFalse(kid_line.startswith("--"))
@@ -591,7 +602,7 @@ class TestMenuRendering(unittest.TestCase):
         the Stats row must not appear and lead to empty headers."""
         empty_cursor = {"sessions": [], "today_turns": 0, "today_sessions": 0,
                         "live": None, "session_map": {}, "n_sessions": 0}
-        out = self.render(bb.stats_submenu, None, None, empty_cursor,
+        out = self.render(bb.stats_submenu, None, None, {"cursor": empty_cursor},
                           datetime.now(timezone.utc).date(), timezone.utc, self.NOW)
         self.assertEqual(out, "")
 
@@ -688,3 +699,97 @@ class TestCursorSessionsBridge(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProviderRegistry(unittest.TestCase):
+    """The registry's whole promise is that a new agent is a table entry, not a new
+    branch in every function. These tests register a fake third provider and assert
+    it reaches detection, config, the agent list, TODAY and Settings on its own."""
+
+    NOW = 1_000_000
+
+    def fake(self, key="opencode", label="OpenCode", detected=True):
+        return {
+            "key": key, "label": label, "icon": "chevron.left.forwardslash.chevron.right",
+            "detect": lambda: detected,
+            "gather": lambda now, tz, now_epoch: {"turns": 7},
+            "rows": lambda pdata, cfg, now_epoch: [
+                {"prov": key, "key": "s1", "label": "a session",
+                 "tok": 150_000, "win": 200_000, "pct": 75.0, "age": 5}],
+            "today": lambda pdata: f"{pdata['turns']:>7} turns",
+            "stats": None, "setup": "#opencode",
+        }
+
+    @contextlib.contextmanager
+    def registered(self, extra):
+        """Add a provider the way a contributor would: append to the table."""
+        providers = bb.PROVIDERS + (extra,)
+        defaults = dict(bb.DEFAULTS)
+        defaults[f"provider_{extra['key']}"] = "on"
+        with mock.patch.object(bb, "PROVIDERS", providers), \
+                mock.patch.object(bb, "PROVIDER_KEYS",
+                                  tuple(p["key"] for p in providers)), \
+                mock.patch.object(bb, "DEFAULTS", defaults), \
+                mock.patch.dict(bb.AGENT_LABEL, {extra["key"]: extra["label"]}), \
+                mock.patch.dict(bb.AGENT_ICON, {extra["key"]: extra["icon"]}):
+            yield
+
+    def test_new_provider_is_detected_and_configurable(self):
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            self.assertEqual(cfg["provider_opencode"], "on")
+            self.assertTrue(bb.active_providers(cfg)["opencode"])
+            # ...and can be pinned off without touching the other agents.
+            cfg.update(providers_mode="manual", provider_opencode="off")
+            active = bb.active_providers(cfg)
+            self.assertFalse(active["opencode"])
+            self.assertTrue(active["claude"])
+
+    def test_new_provider_joins_the_shared_agent_list(self):
+        """Its rows get banded, ranked and labelled by the shared pipeline — the
+        75%/200K session outranks a roomy Claude one despite carrying fewer tokens."""
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            mains = [("c1", {"model": "claude-opus-5", "last_ctx": 40_000,
+                             "peak_ctx": 40_000, "mtime": self.NOW, "title": "Roomy"})]
+            rows = bb.unified_agent_rows(
+                bb.claude_agent_rows({"mains": mains}, cfg, self.NOW)
+                + extra["rows"](None, cfg, self.NOW))
+            self.assertEqual([r["prov"] for r in rows], ["opencode", "claude"])
+            self.assertEqual(rows[0]["tier"], 3)          # 150K on 200K bands -> rot
+            out = TestMenuRendering.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+            self.assertIn("OpenCode", out)
+            self.assertIn(f"sfimage={extra['icon']}", out)
+
+    def test_new_provider_gets_a_today_line_and_a_settings_row(self):
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            prov = bb.active_providers(cfg)
+            # Only the new provider gathers for real; the built-ins would need a
+            # populated ~/.claude and ~/.cursor, which this test isn't about.
+            bundles = {"opencode": extra["gather"](None, None, self.NOW)}
+
+            today = TestMenuRendering.render(bb.emit_today, bundles, None, prov)
+            self.assertIn("OpenCode", today)
+            self.assertIn("7 turns", today)
+            # Its label is padded into the same column as the built-in agents.
+            self.assertRegex(today, r"OpenCode\s+7 turns")
+
+            settings = TestMenuRendering.render(bb.settings_submenu, cfg, prov)
+            self.assertIn("OpenCode", settings)
+            self.assertIn("provider_opencode=off", settings)   # click pins it off
+
+    def test_undetected_provider_stays_out_of_the_menu(self):
+        extra = self.fake(detected=False)
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            prov = bb.active_providers(cfg)
+            self.assertFalse(prov["opencode"])
+            self.assertNotIn("OpenCode",
+                             TestMenuRendering.render(bb.emit_today, {}, None, prov))

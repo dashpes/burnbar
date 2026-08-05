@@ -1,15 +1,18 @@
 # burnbar
 
-A [SwiftBar](https://swiftbar.app) plugin that tracks **CLI agent usage** —
-Claude Code and Cursor Agent today — as a progress bar in the macOS menu bar:
+A [SwiftBar](https://swiftbar.app) plugin that tracks **every AI coding agent you
+run**, in one place, as a progress bar in the macOS menu bar:
 
 ```
 ███▉░ 37% · 3h09m
 ```
 
-It auto-detects what's installed and shows a **Claude** section and/or a
-**Cursor** section. Offline-first: live numbers come from each CLI's statusLine
-bridge written to local files; token/session stats come from local transcripts.
+Claude Code and Cursor Agent ship today, and more are being added — see
+[Adding a provider](#adding-a-provider). burnbar auto-detects what's installed
+and merges every running session into one list, so "how much context has this
+agent burned?" has a single answer regardless of which tool it came from.
+Offline-first: live numbers come from each CLI's statusLine bridge written to
+local files; token/session stats come from local transcripts.
 No API keys, no pricing tables, no telemetry — your usage never leaves your
 machine. (The lone exception: an optional once-a-day check to GitHub for a newer
 version — it sends nothing about you, and it's one toggle away in Settings.)
@@ -147,8 +150,8 @@ The `30s` in the filename is the refresh interval — rename to `burnbar.1m.py`,
 Click the menu bar item → **Settings** to change things live; the selected option
 is checkmarked and saved to `~/.config/burnbar/config.json`:
 
-- **Providers** — `Auto-detect` (default: show whichever CLIs are installed),
-  `Claude only`, `Cursor only`, or `Claude + Cursor`
+- **Providers** — `Auto-detect installed agents` (default), or tick individual
+  agents to pin exactly the set you want shown
 - **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
   (recolors the bar + accent text)
 - **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
@@ -233,11 +236,42 @@ burnbar — keeping the menu bar offline-first.
 - **Cursor session stats** are read from `~/.cursor/projects/**/agent-transcripts`
   and `~/.cursor/chats/**/meta.json` (turn counts and titles — no billed tokens
   on disk).
-- Providers are **auto-detected** (`claude` / `agent` on PATH, or their config
-  dirs). Override under Settings → Providers.
+- Agents are **auto-detected** (`claude` / `agent` on PATH, or their config
+  dirs). Pin the set under Settings → Providers.
 - The menu bar fill bar is colored green → yellow → orange → red as it climbs,
   followed by a reset countdown when Claude limits are live (swap to a token
   count or nothing in Settings).
+
+## Adding a provider
+
+Agents live in the `PROVIDERS` registry near the top of `burnbar.30s.py`. One
+entry drives detection, the settings row, the menu label and icon, the agent
+list and the TODAY line — nothing else needs a new branch:
+
+```python
+{"key": "opencode", "label": "OpenCode", "icon": "chevron.left.forwardslash.chevron.right",
+ "detect": lambda: bool(_which("opencode")),
+ "gather": lambda now, tz, now_epoch: gather_opencode(now, tz),
+ "rows":   lambda pdata, cfg, now_epoch: opencode_agent_rows(pdata, now_epoch),
+ "today":  lambda pdata: f"{pdata['turns']:>7} turns",
+ "stats":  None,                      # optional Stats-submenu section
+ "setup":  "#opencode"},              # docs anchor for the setup nudge
+```
+
+`rows` returns one dict per live session — `{prov, key, label, tok, win, pct,
+age}` — and the shared pipeline does the rest: context-rot banding, ranking
+against every other agent, colouring and rendering. `tok` is the session's
+current context occupancy and `win` its window size (`None` if the agent doesn't
+report one).
+
+If the agent exposes a Claude-Code-style `statusLine` hook, add a bridge script
+modelled on `burnbar-cursor-statusline.py`: writing a per-session heartbeat to
+`~/.config/burnbar/<agent>/sessions.json` is what lets burnbar tell an open
+session from a closed one. Without it, liveness has to be inferred from the
+process table, which is markedly worse (see [How it works](#how-it-works)).
+
+Per-provider visibility is stored as `provider_<key>` in `config.json`; the key
+is added to the defaults automatically from the registry.
 
 Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
 by the model running the latest turn: Opus is the 1M-context model, so an Opus
