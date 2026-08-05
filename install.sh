@@ -7,12 +7,12 @@
 #   curl -fsSL <raw>/install.sh | bash -s -- -y    # unattended (all defaults)
 #
 # It symlinks the plugin into SwiftBar's folder, optionally makes SwiftBar
-# launch at login, and optionally wires the live-usage statusLine bridge.
+# launch at login, and optionally wires Claude + Cursor statusLine bridges.
 #
 # Flags:
 #   -y, --yes     non-interactive; take the default for every prompt
 #       --no-login  don't add the SwiftBar login item
-#       --no-live   don't wire the live-usage statusLine bridge
+#       --no-live   don't wire statusLine bridges
 #   -h, --help    show this help
 set -euo pipefail
 
@@ -51,7 +51,7 @@ else
   SRC="${BURNBAR_HOME:-$HOME/.local/share/burnbar}"
   mkdir -p "$SRC"
   echo "Fetching burnbar into $SRC ..."
-  for f in burnbar.30s.py burnbar-statusline.py; do
+  for f in burnbar.30s.py burnbar-statusline.py burnbar-cursor-statusline.py; do
     # Download to a temp file and make sure it at least parses as Python before
     # swapping it in — a truncated or failed fetch must never clobber a working
     # install. The mv is atomic, so the live symlink target is never half-written.
@@ -67,6 +67,7 @@ else
 fi
 PLUGIN="$SRC/burnbar.30s.py"
 BRIDGE="$SRC/burnbar-statusline.py"
+CURSOR_BRIDGE="$SRC/burnbar-cursor-statusline.py"
 
 # 1. Ensure SwiftBar is installed.
 if [ ! -d "/Applications/SwiftBar.app" ]; then
@@ -140,15 +141,16 @@ PLIST
   fi
 fi
 
-# 5. Live usage bridge — real 5h/7d limits + reset times, captured from Claude
-#    Code's statusLine (the same data the /usage command shows). The same status
-#    line also shows each session's title, so you can tell terminals/tabs apart.
-if [ "$DO_LIVE" = 1 ] && ask "Enable live usage (real limits + reset times + session title in Claude Code's status bar)? [Y/n]" y; then
-  chmod +x "$BRIDGE"
-  mkdir -p "$HOME/.claude"
-  SETTINGS="$HOME/.claude/settings.json"
-  [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.burnbar.bak" && echo "  Backed up -> $SETTINGS.burnbar.bak"
-  FORCE="${FORCE:-0}" python3 - "$BRIDGE" "$SETTINGS" <<'PY'
+# 5. Live usage bridges — Claude rate limits + Cursor context window.
+#    Captured from each CLI's statusLine; burnbar reads the local files offline.
+if [ "$DO_LIVE" = 1 ]; then
+  if command -v claude >/dev/null 2>&1 || [ -d "$HOME/.claude" ]; then
+    if ask "Enable Claude live usage (real 5h/7d limits + session title in status bar)? [Y/n]" y; then
+      chmod +x "$BRIDGE"
+      mkdir -p "$HOME/.claude"
+      SETTINGS="$HOME/.claude/settings.json"
+      [ -f "$SETTINGS" ] && cp "$SETTINGS" "$SETTINGS.burnbar.bak" && echo "  Backed up -> $SETTINGS.burnbar.bak"
+      FORCE="${FORCE:-0}" python3 - "$BRIDGE" "$SETTINGS" <<'PY'
 import json, os, sys
 bridge, p = sys.argv[1], sys.argv[2]
 try:
@@ -158,15 +160,44 @@ except Exception:
 ex = d.get("statusLine")
 clash = isinstance(ex, dict) and ex.get("command") and ex.get("command") != bridge
 if clash and os.environ.get("FORCE") != "1":
-    print("  NOTE: you already have a statusLine configured — leaving it as-is.")
-    print("        Re-run with  FORCE=1 ./install.sh  to replace it, or have your")
-    print("        command also write rate_limits to ~/.config/burnbar/usage.json (see README).")
+    print("  NOTE: you already have a Claude statusLine — leaving it as-is.")
+    print("        Re-run with  FORCE=1 ./install.sh  to replace it.")
 else:
     d["statusLine"] = {"type": "command", "command": bridge, "padding": 0}
     with open(p, "w") as f:
         json.dump(d, f, indent=2)
-    print("  Live usage + session title enabled. Populates on your next Claude Code message.")
+    print("  Claude live usage enabled. Populates on your next Claude Code message.")
 PY
+    fi
+  fi
+
+  if command -v agent >/dev/null 2>&1 || command -v cursor-agent >/dev/null 2>&1 \
+     || [ -f "$HOME/.cursor/cli-config.json" ]; then
+    if ask "Enable Cursor live context (context-window % in Cursor CLI status bar)? [Y/n]" y; then
+      chmod +x "$CURSOR_BRIDGE"
+      mkdir -p "$HOME/.cursor"
+      CSETTINGS="$HOME/.cursor/cli-config.json"
+      [ -f "$CSETTINGS" ] && cp "$CSETTINGS" "$CSETTINGS.burnbar.bak" && echo "  Backed up -> $CSETTINGS.burnbar.bak"
+      FORCE="${FORCE:-0}" python3 - "$CURSOR_BRIDGE" "$CSETTINGS" <<'PY'
+import json, os, sys
+bridge, p = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+ex = d.get("statusLine")
+clash = isinstance(ex, dict) and ex.get("command") and ex.get("command") != bridge
+if clash and os.environ.get("FORCE") != "1":
+    print("  NOTE: you already have a Cursor statusLine — leaving it as-is.")
+    print("        Re-run with  FORCE=1 ./install.sh  to replace it.")
+else:
+    d["statusLine"] = {"type": "command", "command": bridge, "padding": 0}
+    with open(p, "w") as f:
+        json.dump(d, f, indent=2)
+    print("  Cursor live context enabled. Populates on your next Cursor Agent update.")
+PY
+    fi
+  fi
 fi
 
 # 6. Launch / refresh.

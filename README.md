@@ -1,18 +1,18 @@
 # burnbar
 
-A [SwiftBar](https://swiftbar.app) plugin that shows your **real Claude Code
-usage limits** — the same numbers the `/usage` command shows — as a progress bar
-that fills up, right in the macOS menu bar, with a live reset countdown:
+A [SwiftBar](https://swiftbar.app) plugin that tracks **CLI agent usage** —
+Claude Code and Cursor Agent today — as a progress bar in the macOS menu bar:
 
 ```
 ███▉░ 37% · 3h09m
 ```
 
-It pulls Anthropic's live `rate_limits` (5-hour, 7-day, Opus) and pairs them with
-rich token stats from your own local transcripts. No `ccusage`, no API keys, no
-pricing tables, no telemetry — your usage never leaves your machine. (The lone
-exception: an optional once-a-day check to GitHub for a newer version — it sends
-nothing about you, and it's one toggle away in Settings.)
+It auto-detects what's installed and shows a **Claude** section and/or a
+**Cursor** section. Offline-first: live numbers come from each CLI's statusLine
+bridge written to local files; token/session stats come from local transcripts.
+No API keys, no pricing tables, no telemetry — your usage never leaves your
+machine. (The lone exception: an optional once-a-day check to GitHub for a newer
+version — it sends nothing about you, and it's one toggle away in Settings.)
 
 <p align="center">
   <img src="docs/demo.gif" alt="burnbar demo" width="400">
@@ -27,21 +27,41 @@ nothing about you, and it's one toggle away in Settings.)
 
 Click it for a **Stats-style dropdown** with SF Symbol section headers:
 
-- **Usage limits (live)** — 5-hour / 7-day / Opus, each a fill bar with exact
-  `used_percentage` and time-to-reset, straight from Anthropic (cross-surface)
-- **Context (live agents)** — how full each *open* session's context window is, so
-  at a glance you can tell which session still has room and which is about to
-  auto-compact. burnbar shows the sessions that are genuinely running (it matches
-  live `claude` processes to their working dir, so a window you closed drops off
-  right away), labels each with Claude's own session title (the one in the resume
-  picker), and nests any subagents under the session that spawned them
-- **Today** — total tokens, messages, sessions, today's git commits, peak hour, hourly sparkline, by model
-- **Last 7 days** — per-day mini bars, week + month totals
-- **All time** — totals, raw vs effective tokens, sessions, projects, daily
-  average, 24-hour activity sparkline, by model, by project, top sessions
-- **Records** — busiest 5-hour block ever, busiest day
-- **Recent blocks** — your latest rolling windows, the live one highlighted
-- **Settings** — view, theme, menu-bar trailer & width (no JSON editing)
+- **Claude** — live context windows for open sessions (hottest / at-risk first),
+  live 5-hour / 7-day / Opus limits, Today / 7-day / all-time token stats from
+  `~/.claude/projects/**/*.jsonl`
+- **Cursor** — live multi-session context fill (via statusLine bridge; sessions
+  ranked by context size so rot stands out), today's turn counts and recent
+  sessions from `~/.cursor`
+- **CONTEXT AT RISK** — top-of-menu strip tracking two *separate* risks:
+  **quality decay** (`drifting` / `degraded` / `rot`) and **compaction
+  proximity** on % of window (`near full` 70% · `compacting` 85%) — plus a line
+  on what to do about it
+
+  Rot bands are token counts that scale with the window, sub-linearly:
+
+  | window | drifting | degraded | rot |
+  |---|---|---|---|
+  | ≤200K | 32K | 60K | 128K |
+  | 1M | 100K | 200K | 400K |
+
+  Neither raw percentage nor a flat token count works alone. Percentage hides
+  depth — a 1M session at 30% holds 300K tokens and is further gone than a 200K
+  one at 85%. But a flat threshold over-warns on big windows: a model built for
+  1M genuinely holds up past where a 200K one gives out. Hence a table.
+
+  Calibration: [NoLiMa](https://arxiv.org/html/2502.05167v3) (11 of 13 models
+  claiming ≥128K fall below half their short-context baseline at 32K),
+  [RULER](https://arxiv.org/abs/2404.06654) (effective context ≈ 50–65% of
+  advertised), [Chroma's Context Rot](https://www.trychroma.com/research/context-rot)
+  (all 18 frontier models degrade before their limit; distractors compound it),
+  and reported multi-needle effective ranges of 200–400K for current 1M-class
+  flagships. Bands sit on the conservative side of those numbers because agentic
+  coding is multi-needle deep comprehension over a codebase full of near-miss
+  distractors — the hardest case, and harder than what most of these benchmarks
+  test. They're calibrated heuristics, not laws; tune `CTX_BAND_TABLE` to taste.
+- **Settings** — providers (auto / Claude / Cursor / both), view, theme,
+  menu-bar trailer & width (no JSON editing)
 
 ## Install
 
@@ -72,7 +92,7 @@ curl -fsSL https://raw.githubusercontent.com/dashpes/burnbar/main/install.sh | b
 | ------------ | --------------------------------------------------- |
 | `-y, --yes`  | non-interactive; take the default for every prompt  |
 | `--no-login` | skip the SwiftBar login item                        |
-| `--no-live`  | skip wiring the live-usage statusLine bridge        |
+| `--no-live`  | skip wiring Claude / Cursor statusLine bridges      |
 
 > When piped through `curl`, prompts read from your terminal (`/dev/tty`); with
 > no terminal it falls back to the defaults, same as `-y`.
@@ -123,6 +143,8 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 
 - **View** — `Compact` (default: just Today + a *More stats* submenu) or
   `Detailed` (the full stats panel)
+- **Providers** — `Auto-detect` (default: show whichever CLIs are installed),
+  `Claude only`, `Cursor only`, or `Claude + Cursor`
 - **Theme** — `Default`, `Mono`, `Nord`, `Dracula`, `Solarized`, `Matrix`
   (recolors the bar + accent text)
 - **Menu-bar trailer** — what shows after the `%`: `Reset countdown` (e.g.
@@ -140,11 +162,14 @@ marked with `[x]` and saved to `~/.config/burnbar/config.json`:
 
 ## How the live limits work
 
+### Claude Code
+
 The real numbers aren't in any file that `ccusage`-style tools read — Claude Code
 only exposes them through its **statusLine** (a command it feeds a JSON blob on
 every UI update). `burnbar-statusline.py` captures that `rate_limits` object to
-`~/.config/burnbar/usage.json` and prints a compact status line back to Claude
-Code, led by the session's own title so you can tell which terminal/tab is which:
+`~/.config/burnbar/claude/usage.json` and prints a compact status line back to
+Claude Code, led by the session's own title so you can tell which terminal/tab
+is which:
 
 ```
 Add context tracking to burnbar  5h ████░░░░ 48%·2h31m  7d 31%  Opus 4.8
@@ -160,36 +185,44 @@ Add context tracking to burnbar  5h ████░░░░ 48%·2h31m  7d 31% 
 Because Anthropic computes the limits server-side, the captured values already
 include claude.ai web, Claude Code, and every machine you use — and the reset
 times are exact. They refresh whenever you use Claude Code on this Mac; when
-idle, burnbar shows the last-known reading with an "as of" time. Until the
-bridge is wired, the menu bar shows `set up` and points you here.
+idle, burnbar shows the last-known reading with an "as of" time.
 
-> Everything stays on your machine — the bridge only writes a local file. No
-> network calls, no token handling (Claude Code already holds the OAuth token).
+### Cursor CLI
+
+Cursor's statusLine (same shape as Claude's) exposes **context window** fill, not
+plan/quota. `burnbar-cursor-statusline.py` captures that to
+`~/.config/burnbar/cursor/live.json`. Manual setup — add to
+`~/.cursor/cli-config.json`:
+
+```json
+"statusLine": { "type": "command", "command": "/abs/path/to/burnbar-cursor-statusline.py", "padding": 0 }
+```
+
+Cursor plan/quota (Auto % / API %) is server-side only and is **not** fetched by
+burnbar — keeping the menu bar offline-first.
+
+> Everything stays on your machine — the bridges only write local files. No
+> network calls, no token handling (the CLIs already hold their OAuth tokens).
 
 ## How it works
 
-- **Live limits** come from Anthropic via the statusLine bridge above —
+- **Live Claude limits** come from Anthropic via the statusLine bridge —
   `rate_limits` (5-hour / 7-day / Opus) with exact reset times. The menu bar `%`
-  *is* your real 5-hour usage; no estimation involved.
-- **Token stats** are read from `~/.claude/projects/**/*.jsonl` (Claude Code's
-  local transcripts): every assistant turn's `input` / `output` /
-  `cache_creation` / `cache_read`, deduped by message id + request id, grouped
-  into rolling 5-hour blocks and rolled up by day / model / project / session.
+  prefers this when available.
+- **Live Cursor context** comes from Cursor's statusLine (`context_window`) when
+  wired; otherwise the Cursor section shows session activity only.
+- **Claude token stats** are read from `~/.claude/projects/**/*.jsonl`: every
+  assistant turn's `input` / `output` / `cache_creation` / `cache_read`, deduped
+  by message id + request id, grouped into rolling 5-hour blocks and rolled up
+  by day / model / project / session.
+- **Cursor session stats** are read from `~/.cursor/projects/**/agent-transcripts`
+  and `~/.cursor/chats/**/meta.json` (turn counts and titles — no billed tokens
+  on disk).
+- Providers are **auto-detected** (`claude` / `agent` on PATH, or their config
+  dirs). Override under Settings → Providers.
 - The menu bar fill bar is colored green → yellow → orange → red as it climbs,
-  followed by a reset countdown (swap to a token count or nothing in Settings).
-- **Context (live agents)** reads the same transcripts: a session's current
-  context-window fill is its latest turn's prompt size (`input` +
-  `cache_creation` + `cache_read` — what the model was actually sent). To show
-  only sessions that are *actually open*, burnbar matches each running `claude`
-  process to its working directory (`pgrep` + `lsof`) instead of guessing from
-  recency — so a window you just closed disappears immediately, and two terminals
-  in the same repo are counted separately; if it can't read processes it falls
-  back to a recent-activity window. Subagents still running are nested under the
-  session that spawned them (linked by the `sessionId` in each `agent-*.jsonl`)
-  and drop off the moment they finish. Rows are labelled with Claude's
-  auto-generated session title (the `aiTitle` it writes to the transcript and
-  shows in the resume picker), falling back to the project folder and git branch.
-  The bar reddens as the window fills, so a session about to compact stands out.
+  followed by a reset countdown when Claude limits are live (swap to a token
+  count or nothing in Settings).
 
 Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
 by the model running the latest turn: Opus is the 1M-context model, so an Opus
@@ -197,16 +230,17 @@ session is sized to 1M; Haiku/Sonnet sessions use the standard 200K (with a
 fallback to 1M for anything that's somehow crossed 200K). If you run a fixed
 setup, pin it to `200K` or `1M` in Settings.
 
-Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the token
-stats, since they're far lighter than fresh tokens — this makes "effective
+Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the Claude
+token stats, since they're far lighter than fresh tokens — this makes "effective
 tokens" track real burn rather than cache reuse. Set it to `1.0` to count every
 token equally.
 
 ## Footprint
 
-burnbar creates no growing files of its own — `usage.json`, `config.json`, and
-`cache.json` are all fixed-size or overwritten. The transcripts it reads are
-written and owned by Claude Code, not burnbar.
+burnbar creates no growing files of its own — `claude/usage.json`,
+`cursor/live.json`, `cursor/sessions.json`, `config.json`, and `cache.json` are
+all fixed-size or overwritten (sessions prune after 2h idle). The transcripts it
+reads are written and owned by each CLI, not burnbar.
 
 To stay fast no matter how large that history grows, burnbar keeps an
 **incremental cache** (`~/.config/burnbar/cache.json`): each transcript's totals

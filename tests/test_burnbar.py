@@ -3,11 +3,15 @@
 Deliberately small and dependency-free (stdlib unittest): they cover the bits
 that have actually bitten us — version parsing (broke the release), the live-
 session tier selection (showed closed sessions as live) — plus the token/format
-helpers. Run with:  python3 -m unittest discover -s tests
+helpers and multi-provider detection. Run with:  python3 -m unittest discover -s tests
 """
 import importlib.util
+import json
 import os
+import tempfile
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
 # The plugin's filename ('burnbar.30s.py') isn't a valid module name, so load it
 # by path. Importing only runs module-level constants + a self-version read; no
@@ -41,6 +45,9 @@ class TestVersion(unittest.TestCase):
         self.assertEqual(bb.parse_version_header(text), "0.6.0")
         self.assertIsNone(bb.parse_version_header("no header here"))
         self.assertIsNone(bb.parse_version_header(None))
+
+    def test_plugin_version_is_1_4(self):
+        self.assertEqual(bb.VERSION, "1.4.0")
 
 
 class TestFormatting(unittest.TestCase):
@@ -193,6 +200,209 @@ class TestLimitView(unittest.TestCase):
     def test_missing_percentage_defaults_zero(self):
         v = bb.limit_view({"resets_at": self.now + 100}, self.now, self.window)
         self.assertEqual(v["pc"], 0)
+
+
+class TestProviders(unittest.TestCase):
+    def test_active_providers_modes(self):
+        self.assertEqual(bb.active_providers({"providers": "claude"}),
+                         {"claude": True, "cursor": False})
+        self.assertEqual(bb.active_providers({"providers": "cursor"}),
+                         {"claude": False, "cursor": True})
+        self.assertEqual(bb.active_providers({"providers": "both"}),
+                         {"claude": True, "cursor": True})
+
+    def test_auto_uses_detect(self):
+        with mock.patch.object(bb, "detect_claude", return_value=True), \
+             mock.patch.object(bb, "detect_cursor", return_value=False):
+            self.assertEqual(bb.active_providers({"providers": "auto"}),
+                             {"claude": True, "cursor": False})
+
+    def test_cursor_project_slug(self):
+        self.assertEqual(bb._cursor_project_slug("Users-me-Dev-burnbar"), "burnbar")
+
+
+class TestGatherCursor(unittest.TestCase):
+    def test_gather_from_fixtures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "projects", "Users-me-Dev-app")
+            sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            txdir = os.path.join(proj, "agent-transcripts", sid)
+            os.makedirs(txdir)
+            tx = os.path.join(txdir, f"{sid}.jsonl")
+            with open(tx, "w") as f:
+                f.write(json.dumps({"role": "user", "message": {"content": []}}) + "\n")
+                f.write(json.dumps({"role": "assistant",
+                                    "message": {"content": []}}) + "\n")
+            chats = os.path.join(tmp, "chats", "hash", sid)
+            os.makedirs(chats)
+            with open(os.path.join(chats, "meta.json"), "w") as f:
+                json.dump({"title": "Fixture Chat", "cwd": "/tmp/app"}, f)
+            live = os.path.join(tmp, "live.json")
+            with open(live, "w") as f:
+                json.dump({
+                    "captured_at": 1_000_000,
+                    "session_id": sid,
+                    "session_name": "Fixture Chat",
+                    "model": "Auto",
+                    "context_window": {"used_percentage": 42,
+                                       "context_window_size": 200000},
+                }, f)
+
+            old_proj = bb.CURSOR_PROJECTS
+            old_chats = bb.CURSOR_CHATS
+            old_live = bb.CURSOR_LIVE_PATH
+            bb.CURSOR_PROJECTS = os.path.join(tmp, "projects")
+            bb.CURSOR_CHATS = os.path.join(tmp, "chats")
+            bb.CURSOR_LIVE_PATH = live
+            try:
+                data = bb.gather_cursor(datetime.now(timezone.utc), timezone.utc)
+            finally:
+                bb.CURSOR_PROJECTS = old_proj
+                bb.CURSOR_CHATS = old_chats
+                bb.CURSOR_LIVE_PATH = old_live
+
+            self.assertEqual(data["n_sessions"], 1)
+            self.assertEqual(data["sessions"][0]["title"], "Fixture Chat")
+            self.assertEqual(data["sessions"][0]["turns"], 2)
+            self.assertEqual(data["live"]["context_window"]["used_percentage"], 42)
+
+
+class TestContextRisk(unittest.TestCase):
+    def test_fresh_cursor_sessions_sorts_hottest_first(self):
+        now = 1_000_000
+        smap = {
+            "a": {"captured_at": now - 10, "session_name": "cool",
+                  "context_window": {"used_percentage": 20}},
+            "b": {"captured_at": now - 5, "session_name": "hot",
+                  "context_window": {"used_percentage": 88}},
+            "c": {"captured_at": now - 9999, "session_name": "stale",
+                  "context_window": {"used_percentage": 99}},
+        }
+        rows = bb.fresh_cursor_sessions(smap, now, stale_min=30)
+        self.assertEqual([r[0] for r in rows], ["b", "a"])
+        self.assertEqual(rows[0][2], 88)
+
+    def test_collect_context_risks(self):
+        claude = [("Sess A", 72.0, 144_000, 200_000, {}),
+                  ("Sess B", 40.0, 8_000, 200_000, {})]
+        cursor = [("c1", {"session_name": "Cursor Hot",
+                          "context_window": {"used_percentage": 90,
+                                             "context_window_size": 200_000}}, 90.0)]
+        risks = bb.collect_context_risks(claude, cursor, warn=70)
+        self.assertEqual(len(risks), 2)
+        # Both rot on 200K bands; 180K beats 144K. Sess B (8K, 40%) isn't at risk.
+        self.assertEqual(risks[0][0], "Cursor")
+        self.assertEqual(risks[0][2], 90)
+        self.assertEqual(risks[1][0], "Claude")
+
+    def test_risk_ranks_by_tier_then_tokens(self):
+        """A smaller session judged against a smaller window can be further gone:
+        150K/200K is rot, 300K/1M only degraded, so the 150K one leads despite
+        carrying half the tokens."""
+        claude = [("Opus 1M", 30.0, 300_000, 1_000_000, {}),
+                  ("Small", 75.0, 150_000, 200_000, {})]
+        risks = bb.collect_context_risks(claude, [], warn=70)
+        self.assertEqual([r[1] for r in risks], ["Small", "Opus 1M"])
+        self.assertEqual(risks[0][4], 3)
+        self.assertEqual(risks[1][4], 2)
+
+    def test_low_percentage_high_tokens_is_flagged(self):
+        """A 1M session at 30% would never trip a %-based threshold, but 300K is
+        past the 1M-class 'degraded' floor, so it still surfaces."""
+        risks = bb.collect_context_risks(
+            [("Roomy", 30.0, 300_000, 1_000_000, {})], [], warn=70)
+        self.assertEqual(len(risks), 1)
+        self.assertIn("degraded", risks[0][5])
+
+
+class TestContextBands(unittest.TestCase):
+    def test_bands_200k_class(self):
+        for tokens, tier, label in ((0, 0, "sharp"), (31_999, 0, "sharp"),
+                                    (32_000, 1, "drifting"), (60_000, 2, "degraded"),
+                                    (128_000, 3, "rot"), (190_000, 3, "rot")):
+            self.assertEqual(bb.ctx_band(tokens, 200_000), (tier, label), tokens)
+
+    def test_bands_scale_with_window(self):
+        """The 1M correction: a model built for 1M isn't judged by 200K's ruler."""
+        self.assertEqual(bb.ctx_band(33_000, 1_000_000), (0, "sharp"))
+        self.assertEqual(bb.ctx_band(33_000, 200_000), (1, "drifting"))
+        self.assertEqual(bb.ctx_band(150_000, 1_000_000), (1, "drifting"))
+        self.assertEqual(bb.ctx_band(150_000, 200_000), (3, "rot"))
+        # ...but a 1M window is still not 1M of usable context.
+        self.assertEqual(bb.ctx_band(450_000, 1_000_000), (3, "rot"))
+
+    def test_unknown_window_falls_back_to_strictest(self):
+        self.assertEqual(bb.ctx_band(70_000, None), (2, "degraded"))
+        self.assertEqual(bb.ctx_band(70_000, 0), (2, "degraded"))
+
+    def test_tags_carry_both_signals(self):
+        tier, tags = bb.ctx_tags(150_000, 95.0, 200_000)
+        self.assertEqual(tier, 3)
+        self.assertEqual(tags, ["rot", "compacting"])
+        tier, tags = bb.ctx_tags(5_000, 92.0, 200_000)   # tiny context, full window
+        self.assertEqual(tier, 0)
+        self.assertEqual(tags, ["compacting"])
+        self.assertEqual(bb.ctx_tags(1_000, 10.0, 200_000), (0, []))
+
+    def test_cursor_ctx_tokens(self):
+        e = {"context_window": {"used_percentage": 61.9, "context_window_size": 256_000}}
+        self.assertEqual(bb.cursor_ctx_tokens(e), 158_464)
+        self.assertIsNone(bb.cursor_ctx_tokens({"context_window": {}}))
+        self.assertIsNone(bb.cursor_ctx_tokens({}))
+
+
+class TestCursorSessionsBridge(unittest.TestCase):
+    def test_statusline_merges_sessions(self):
+        """Load the Cursor statusline module and ensure multi-session merge works."""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "burnbar-cursor-statusline.py")
+        spec = importlib.util.spec_from_file_location("bb_cursor_sl", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live.json")
+            sess = os.path.join(tmp, "sessions.json")
+            mod.LIVE_PATH = live
+            mod.SESSIONS_PATH = sess
+            import io
+            import contextlib
+            payload1 = json.dumps({
+                "session_id": "s1", "session_name": "One",
+                "model": {"display_name": "Auto"},
+                "context_window": {"used_percentage": 40, "context_window_size": 200000},
+            })
+            payload2 = json.dumps({
+                "session_id": "s2", "session_name": "Two",
+                "model": {"display_name": "Auto"},
+                "context_window": {"used_percentage": 80, "context_window_size": 200000},
+            })
+            for p in (payload1, payload2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with mock.patch("sys.stdin", io.StringIO(p)):
+                        mod.main()
+            with open(sess) as f:
+                store = json.load(f)
+            self.assertIn("s1", store["sessions"])
+            self.assertIn("s2", store["sessions"])
+            self.assertEqual(store["sessions"]["s2"]["context_window"]["used_percentage"], 80)
+
+    def test_loads_legacy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = os.path.join(tmp, "usage.json")
+            new = os.path.join(tmp, "claude", "usage.json")
+            payload = {"rate_limits": {"five_hour": {"used_percentage": 10,
+                                                     "resets_at": 9_999_999}}}
+            with open(legacy, "w") as f:
+                json.dump(payload, f)
+            old_u, old_l = bb.USAGE_PATH, bb.USAGE_PATH_LEGACY
+            bb.USAGE_PATH, bb.USAGE_PATH_LEGACY = new, legacy
+            try:
+                u = bb.load_usage()
+            finally:
+                bb.USAGE_PATH, bb.USAGE_PATH_LEGACY = old_u, old_l
+            self.assertIsNotNone(u)
+            self.assertEqual(u["rate_limits"]["five_hour"]["used_percentage"], 10)
+            self.assertTrue(os.path.exists(new))
 
 
 if __name__ == "__main__":

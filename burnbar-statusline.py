@@ -9,7 +9,7 @@ opus), already aggregated across claude.ai web, Claude Code, and every machine,
 with exact `resets_at` timestamps.
 
 This script:
-  1. captures that `rate_limits` object to ~/.config/burnbar/usage.json
+  1. captures that `rate_limits` object to ~/.config/burnbar/claude/usage.json
      (so the burnbar SwiftBar plugin can show real numbers), and
   2. prints a compact status line back to Claude Code.
 
@@ -20,7 +20,8 @@ import os
 import sys
 import time
 
-USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")
+USAGE_PATH = os.path.expanduser("~/.config/burnbar/claude/usage.json")
+USAGE_PATH_LEGACY = os.path.expanduser("~/.config/burnbar/usage.json")
 
 
 def fmt_dur(secs):
@@ -90,6 +91,12 @@ def main():
             with open(tmp, "w") as f:
                 json.dump(payload, f)
             os.replace(tmp, USAGE_PATH)
+            # Drop the pre-1.4 path so we don't leave a stale sibling behind.
+            try:
+                if os.path.exists(USAGE_PATH_LEGACY):
+                    os.remove(USAGE_PATH_LEGACY)
+            except Exception:
+                pass
         except Exception:
             pass
 

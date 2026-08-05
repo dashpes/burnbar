@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.3.0</bitbar.version>
+# <bitbar.version>1.4.0</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
-# <bitbar.desc>Claude Code usage: 5-hour-block burn bar + stats dropdown, themeable.</bitbar.desc>
+# <bitbar.desc>CLI agent usage (Claude Code + Cursor): live burn bar + stats dropdown.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
 # <swiftbar.hideAbout>false</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
@@ -11,12 +11,13 @@
 """
 burnbar — a SwiftBar/xbar plugin.
 
-Menu bar:  a live progress bar for your current Claude Code 5-hour usage block.
-Dropdown:  a Stats-style panel (compact by default, or detailed), with Settings
-           submenu for theme / view / bar width — no JSON editing required.
+Menu bar:  a live progress bar for your current usage (Claude rate limits when
+           available, else Cursor context fill).
+Dropdown:  per-provider sections (Claude Code, Cursor CLI, …) auto-detected from
+           what's installed; Stats-style panel with Settings submenu.
 
-All from Claude Code's own local transcripts (~/.claude/projects/**/*.jsonl).
-No ccusage, no API keys, no network, no pricing.
+Offline-first: reads local transcripts + statusLine bridge files. No API keys,
+no pricing tables. Optional once-a-day GitHub version check only.
 
 Settings are stored in ~/.config/burnbar/config.json and changed by clicking
 items in the Settings submenu (which re-invoke this script with --set).
@@ -27,6 +28,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -38,8 +40,13 @@ BLOCK_HOURS = 5
 BAR_CELLS = 10                   # bar width inside the dropdown
 PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 CONFIG_PATH = os.path.expanduser("~/.config/burnbar/config.json")
-USAGE_PATH = os.path.expanduser("~/.config/burnbar/usage.json")  # live rate_limits
-CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # per-file rollups
+USAGE_PATH = os.path.expanduser("~/.config/burnbar/claude/usage.json")
+USAGE_PATH_LEGACY = os.path.expanduser("~/.config/burnbar/usage.json")
+CURSOR_LIVE_PATH = os.path.expanduser("~/.config/burnbar/cursor/live.json")
+CURSOR_SESSIONS_PATH = os.path.expanduser("~/.config/burnbar/cursor/sessions.json")
+CURSOR_PROJECTS = os.path.expanduser("~/.cursor/projects")
+CURSOR_CHATS = os.path.expanduser("~/.cursor/chats")
+CACHE_PATH = os.path.expanduser("~/.config/burnbar/cache.json")  # Claude per-file rollups
 UPDATE_PATH = os.path.expanduser("~/.config/burnbar/update.json")  # daily update check
 CACHE_VERSION = 5                # bumped: per-file aggregates now carry context info
 
@@ -74,6 +81,46 @@ CONTEXT_MAX_ROWS = 6             # cap on main sessions shown
 CONTEXT_MAX_AGENTS = 5           # cap on subagents shown per parent
 CONTEXT_NAME_W = 32              # name column width (titles truncated to fit the tree)
 CONTEXT_TEXT_SIZE = 11           # context rows are a touch smaller, so longer titles fit
+CONTEXT_WARN_PCT = 70            # nearing the window: compaction is coming
+CONTEXT_CRIT_PCT = 85            # compaction imminent — you're about to lose detail
+CURSOR_CTX_STALE_MIN = 30        # drop Cursor statusLine readings older than this
+
+# ── context rot bands (absolute tokens) ──
+# Degradation tracks *absolute* context size far more than % of window: a 1M-window
+# session at 30% holds 300K tokens and is deeper into rot than a 200K one at 85%.
+# So % drives the compaction warning above, and these bands drive the quality one.
+# The thresholds come from published long-context evals, not round numbers:
+#   32K  NoLiMa (Adobe, ICML'25) — 11 of 13 models claiming >=128K fall below half
+#        their short-context baseline here.
+#   60K  Chroma "Context Rot" (2025) — all 18 frontier models degrade well before
+#        their limit; a 200K-window model shows real degradation by ~50K.
+#  128K  RULER (NVIDIA) — effective context is ~50-65% of the advertised window,
+#        so past this recall is unreliable whatever the window claims.
+# These are retrieval/reasoning benchmark findings, not a measured cliff in coding
+# agents: calibrated heuristics, not laws. Coding sessions likely fare *worse* —
+# Chroma found distractors compound the effect, and a codebase is full of near-misses.
+#
+# Bands scale with the window, but *sub-linearly* — which is why this is a table
+# and not a percentage. A model built for 1M genuinely holds up past where a 200K
+# one gives out (published recall stays high to ~600-700K on simple retrieval), so
+# flat thresholds over-warn on big windows. But it doesn't hold up proportionally:
+# on multi-needle work, effective context for current frontier models lands in the
+# 200-400K band, with one measured flagship at 57.5% over 256-512K and 36.6% over
+# 512K-1M. The window is a capacity limit, not a quality guarantee.
+#
+# Bands stay on the conservative side of those numbers on purpose: the evals above
+# are retrieval/comprehension tests, while an agentic coding session is
+# multi-needle deep comprehension — the hardest case — with a codebase full of
+# near-miss distractors, which Chroma found compounds the decay. Fiction.LiveBench,
+# which tests comprehension rather than recall, sees slippage closer to 32K and
+# suggests a usable band of 16-64K for most models.
+CTX_BAND_TABLE = (
+    # window     drifting  degraded      rot
+    (200_000, (32_000, 60_000, 128_000)),
+    (1_000_000, (100_000, 200_000, 400_000)),
+)
+CTX_BAND_NAMES = ("drifting", "degraded", "rot")
+CTX_RISK_TIER = 2                # surface in the at-risk strip from "degraded" up
 MONO = "Menlo"
 
 # ── commits-today tracking ──
@@ -117,9 +164,11 @@ DEFAULTS = {
     "commits": "on",             # show today's git commit count in TODAY: on | off
     "commit_author": "",         # whose commits to count; "" = your git identity
     "commit_dirs": [],           # folders to scan for repos; [] = sensible defaults
+    "providers": "auto",         # auto | claude | cursor | both
 }
 MENUBAR_EXTRAS = ("countdown", "tokens", "none")
 CONTEXT_WINDOWS = ("auto", "200k", "1m")
+PROVIDERS = ("auto", "claude", "cursor", "both")
 
 # ── themes: a full palette, so the whole dropdown gets tinted ──
 #   grad  = (low, mid, high, max) bar gradient + alert accents (by % burn)
@@ -199,6 +248,16 @@ def load_config():
         cfg["update_check"] = "on"
     if cfg.get("commits") not in ("on", "off"):
         cfg["commits"] = "on"
+    if cfg.get("providers") not in PROVIDERS:
+        cfg["providers"] = "auto"
+    try:
+        cfg["menubar_cells"] = max(3, min(12, int(cfg.get("menubar_cells", 5))))
+    except Exception:
+        cfg["menubar_cells"] = 5
+    if not isinstance(cfg.get("commit_author"), str):
+        cfg["commit_author"] = ""
+    if not isinstance(cfg.get("commit_dirs"), list):
+        cfg["commit_dirs"] = []
     return cfg
 
 
@@ -291,6 +350,49 @@ def ctx_label(win):
     return "1M" if win >= CTX_1M else f"{win // 1000}K"
 
 
+def ctx_band_floors(win):
+    """The (drifting, degraded, rot) token floors for a given window size.
+
+    Picks the largest calibrated window class the model's window reaches, so a
+    1M model gets 1M-class bands and everything smaller gets the 200K ones."""
+    floors = CTX_BAND_TABLE[0][1]
+    for cls, f in CTX_BAND_TABLE:
+        if (win or 0) >= cls:
+            floors = f
+    return floors
+
+
+def ctx_band(tokens, win=None):
+    """Context-rot tier for a context size: (tier, label).
+
+    tier 0 sharp · 1 drifting · 2 degraded · 3 rot. Driven by absolute tokens
+    against window-scaled floors — a 1M session at 30% is carrying 300K and is
+    further gone than a 200K one at 85%, but it isn't judged by 200K's ruler."""
+    tokens = tokens or 0
+    floors = ctx_band_floors(win)
+    for i in range(len(floors) - 1, -1, -1):
+        if tokens >= floors[i]:
+            return i + 1, CTX_BAND_NAMES[i]
+    return 0, "sharp"
+
+
+def band_color(tier):
+    """Rot tier -> theme gradient stop (same 4 stops the % bars use)."""
+    return TH["grad"][max(0, min(tier, 3))]
+
+
+def ctx_tags(tokens, pct, win=None):
+    """The two independent signals for one session, as display tags:
+    quality (tokens vs the window's rot bands) and compaction proximity (% full)."""
+    tier, label = ctx_band(tokens, win)
+    tags = [label] if tier else []
+    if pct >= CONTEXT_CRIT_PCT:
+        tags.append("compacting")
+    elif pct >= CONTEXT_WARN_PCT:
+        tags.append("near full")
+    return tier, tags
+
+
 def ellipsis(s, n):
     s = s or ""
     return s if len(s) <= n else s[:n - 1] + "…"
@@ -367,15 +469,223 @@ def save_cache(cache):
 
 
 def load_usage():
-    """Live rate_limits captured by the statusLine bridge, or None."""
+    """Live Claude rate_limits captured by the statusLine bridge, or None.
+    Migrates pre-1.4 ~/.config/burnbar/usage.json into claude/usage.json once."""
+    for path in (USAGE_PATH, USAGE_PATH_LEGACY):
+        try:
+            with open(path) as f:
+                u = json.load(f)
+            if not (u.get("rate_limits") or {}).get("five_hour"):
+                continue
+            if path == USAGE_PATH_LEGACY and not os.path.exists(USAGE_PATH):
+                try:
+                    os.makedirs(os.path.dirname(USAGE_PATH), exist_ok=True)
+                    shutil.copy2(path, USAGE_PATH)
+                except Exception:
+                    pass
+            return u
+        except Exception:
+            continue
+    return None
+
+
+def load_cursor_live():
+    """Latest Cursor context_window capture (single-file, for menubar fallback)."""
     try:
-        with open(USAGE_PATH) as f:
+        with open(CURSOR_LIVE_PATH) as f:
             u = json.load(f)
-        if (u.get("rate_limits") or {}).get("five_hour"):
+        if u.get("context_window") is not None or u.get("session_id"):
             return u
     except Exception:
         pass
     return None
+
+
+def load_cursor_session_map():
+    """Per-session Cursor context registry written by the statusLine bridge.
+    Falls back to live.json alone so a single-session install still works."""
+    sessions = {}
+    try:
+        with open(CURSOR_SESSIONS_PATH) as f:
+            store = json.load(f)
+        raw = store.get("sessions") if isinstance(store, dict) else None
+        if isinstance(raw, dict):
+            sessions.update(raw)
+    except Exception:
+        pass
+    live = load_cursor_live()
+    if live:
+        sid = live.get("session_id") or "_live"
+        # Prefer the registry entry if newer; else seed from live.json.
+        prev = sessions.get(sid)
+        if not prev or (live.get("captured_at") or 0) >= (prev.get("captured_at") or 0):
+            sessions[sid] = live
+    return sessions
+
+
+def cursor_ctx_pct(entry):
+    """used_percentage from a Cursor live/session entry, or None."""
+    try:
+        p = (entry.get("context_window") or {}).get("used_percentage")
+        return float(p) if p is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def cursor_ctx_tokens(entry):
+    """Absolute context tokens for a Cursor session, or None.
+
+    Cursor's `total_input_tokens` is itself derived from used_percentage (its docs
+    say so, and the arithmetic confirms it), so deriving from pct x window is the
+    same number with no extra assumption — and it still works when the field is null.
+    """
+    cw = entry.get("context_window") or {}
+    pct = cursor_ctx_pct(entry)
+    try:
+        size = float(cw.get("context_window_size") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pct is None or size <= 0:
+        return None
+    return int(pct / 100.0 * size)
+
+
+def cursor_session_label(entry):
+    name = entry.get("session_name")
+    if name:
+        return name
+    cwd = entry.get("cwd") or ""
+    if cwd:
+        return os.path.basename(cwd.rstrip("/")) or cwd
+    return entry.get("session_id") or "session"
+
+
+def fresh_cursor_sessions(session_map, now_epoch, stale_min=CURSOR_CTX_STALE_MIN):
+    """Sessions with a usable context % that statusLine refreshed recently, worst
+    first. Ranked by absolute tokens (the rot risk), not % — a 62%/256K session is
+    carrying more context than an 85%/200K one, so it leads."""
+    cut = now_epoch - stale_min * 60
+    rows = []
+    for sid, entry in (session_map or {}).items():
+        if (entry.get("captured_at") or 0) < cut:
+            continue
+        pct = cursor_ctx_pct(entry)
+        if pct is None:
+            continue
+        rows.append((sid, entry, pct))
+    rows.sort(key=lambda r: (-(cursor_ctx_tokens(r[1]) or 0), -r[2],
+                             -(r[1].get("captured_at") or 0)))
+    return rows
+
+
+def claude_live_context_rows(by_session, now, cfg):
+    """Same live-session selection as emit_context, returned as (label, pct, sv) for
+    the shared at-risk strip — without printing."""
+    if not by_session:
+        return []
+    now_ts = now.timestamp()
+    mode = cfg["context_window"]
+
+    def agent_running(av):
+        if now_ts - av.get("mtime", 0) > CONTEXT_AGENT_MIN * 60:
+            return False
+        parent = by_session.get(av.get("sid"))
+        if parent and not parent.get("agent"):
+            return av.get("mtime", 0) >= parent.get("mtime", 0)
+        return True
+
+    cand = sorted((kv for kv in by_session.items()
+                   if not kv[1].get("agent") and kv[1].get("last_ctx", 0) > 0),
+                  key=lambda kv: -kv[1].get("mtime", 0))
+    live_n, by_dir = live_session_cwds()
+    mains = select_live_mains(cand, live_n, by_dir, now_ts)
+    rows = []
+    for _k, sv in mains[:CONTEXT_MAX_ROWS]:
+        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
+        used = sv.get("last_ctx", 0)
+        pct = min(100.0, 100.0 * used / win) if win else 0.0
+        rows.append((ctx_session_label(sv), pct, used, win, sv))
+    rows.sort(key=lambda r: -r[2])
+    return rows
+
+
+def collect_context_risks(claude_rows, cursor_rows, warn=CONTEXT_WARN_PCT):
+    """Unified at-risk list, worst first: (provider, label, pct, tokens, tier, tags).
+
+    A session is at risk for either reason, and they're genuinely different:
+    quality decay (tokens past the window's rot bands) or imminent compaction
+    (% of window). Ranking is by rot tier first — how degraded the session
+    actually is — then by raw tokens to break ties within a tier."""
+    risks = []
+    rows = ([("Claude", label, pct, tok, win) for label, pct, tok, win, _sv in claude_rows]
+            + [("Cursor", cursor_session_label(entry), pct, cursor_ctx_tokens(entry),
+                (entry.get("context_window") or {}).get("context_window_size"))
+               for _sid, entry, pct in cursor_rows])
+    for prov, label, pct, tok, win in rows:
+        tier, tags = ctx_tags(tok, pct, win)
+        if tier >= CTX_RISK_TIER or pct >= warn:
+            risks.append((prov, label, pct, tok or 0, tier, tags))
+    risks.sort(key=lambda r: (-r[4], -r[3], -r[2]))
+    return risks
+
+
+def emit_context_risk_strip(risks):
+    """Top-of-menu callout when any live agent is degrading — the context-rot signal.
+
+    The bar length is window fill; its colour is the rot band. Those two can
+    disagree (that's the point), so both numbers are shown."""
+    if not risks:
+        return
+    emit("CONTEXT AT RISK", color=MUTED, sfimage="exclamationmark.triangle.fill",
+         header=True)
+    worst = 0
+    for prov, label, pct, tok, tier, tags in risks[:CONTEXT_MAX_ROWS]:
+        worst = max(worst, tier)
+        tail = (" · " + " · ".join(tags)) if tags else ""
+        emit(f"{prov} · {ellipsis(label, 20)}  {render_bar(pct / 100, 6)} "
+             f"{compact(tok):>5} · {round(pct)}%{tail}",
+             color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
+    emit(ctx_risk_advice(worst), color=MUTED, size=CONTEXT_TEXT_SIZE)
+    sep()
+
+
+def ctx_risk_advice(tier):
+    """One actionable line — a warning that only says 'degraded' is just anxiety.
+    No token figure here: the floors move with the window (see CTX_BAND_TABLE)."""
+    if tier >= 3:
+        return "Recall is unreliable this deep · /compact or start fresh"
+    if tier >= 2:
+        return "Quality drops well before the window fills · consider /compact"
+    return "Nearing the window · compaction will drop detail"
+
+
+def _which(cmd):
+    return shutil.which(cmd)
+
+
+def detect_claude():
+    return bool(_which("claude")
+                or glob.glob(os.path.expanduser("~/.claude/projects/**/*.jsonl"),
+                             recursive=True)[:1]
+                or os.path.isdir(os.path.expanduser("~/.claude")))
+
+
+def detect_cursor():
+    return bool(_which("agent") or _which("cursor-agent")
+                or os.path.exists(os.path.expanduser("~/.cursor/cli-config.json"))
+                or os.path.isdir(CURSOR_PROJECTS) or os.path.isdir(CURSOR_CHATS))
+
+
+def active_providers(cfg):
+    """Which provider sections to show, from config + auto-detection."""
+    mode = cfg.get("providers") or "auto"
+    if mode == "claude":
+        return {"claude": True, "cursor": False}
+    if mode == "cursor":
+        return {"claude": False, "cursor": True}
+    if mode == "both":
+        return {"claude": True, "cursor": True}
+    return {"claude": detect_claude(), "cursor": detect_cursor()}
 
 
 # ─────────────────────────── update check ───────────────────────────
@@ -929,7 +1239,8 @@ def ctx_session_label(sv):
 
 def ctx_row(sv, now_ts, mode, agent=False):
     """One agent's context-window fill, as a tree row: the (truncated) name leads
-    so subagents nest visibly under their parent; bar + numbers + freshness follow."""
+    so subagents nest visibly under their parent; bar + numbers + freshness follow.
+    Sessions nearing the window get a ·full / ·rot tag so context rot stands out."""
     win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
     used = sv.get("last_ctx", 0)
     frac = used / win if win else 0.0
@@ -941,9 +1252,11 @@ def ctx_row(sv, now_ts, mode, agent=False):
         name = f"  ↳ {model_short(sv.get('model'))}" + (f" {aid}" if aid else "")
     else:
         name = ctx_session_label(sv)
+    tier, tags = ctx_tags(used, pct, win)
+    tail = (" · " + " · ".join(tags)) if tags else ""
     emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} {render_bar(frac, 6)} "
-         f"{pct:>3}% {compact(used):>5}/{ctx_label(win)} · {when}",
-         color=adaptive(color_for(pct)), size=CONTEXT_TEXT_SIZE)
+         f"{pct:>3}% {compact(used):>5}/{ctx_label(win)} · {when}{tail}",
+         color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
 
 
 def live_session_cwds():
@@ -1066,7 +1379,14 @@ def emit_context(by_session, now, cfg):
             emit(f"  ↳ +{len(kids) - CONTEXT_MAX_AGENTS} more", color=MUTED,
                  size=CONTEXT_TEXT_SIZE)
 
-    for key, sv in mains[:CONTEXT_MAX_ROWS]:
+    # Hottest context first — context rot is the signal people watch for.
+    def fill_pct(sv):
+        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
+        used = sv.get("last_ctx", 0)
+        return (used / win) if win else 0.0
+
+    mains_sorted = sorted(mains[:CONTEXT_MAX_ROWS], key=lambda kv: -fill_pct(kv[1]))
+    for key, sv in mains_sorted:
         ctx_row(sv, now_ts, mode)
         emit_agents(by_parent.get(key, []))
     # Subagents still running while their parent has gone idle (or fell past the cap).
@@ -1076,57 +1396,214 @@ def emit_context(by_session, now, cfg):
     sep()
 
 
-# ─────────────────────────── main ───────────────────────────
-def main():
-    global TH, MUTED, PLAN
-    cfg = load_config()
-    TH = THEMES[cfg["theme"]]
-    MUTED = TH["muted"]
-    PLAN = read_plan()
-    cells = cfg["menubar_cells"]
-    title_size = cfg["title_size"]
-    compact_view = cfg["view"] == "compact"
+# ─────────────────────── Cursor (offline) ───────────────────────
+def _cursor_project_slug(path):
+    """Users-foo-Dev-bar -> last path segment as a short label."""
+    base = os.path.basename(path.rstrip("/"))
+    if not base:
+        return "?"
+    # slug is abs path with / -> -
+    pretty = base.replace("-", "/")
+    return pretty.rstrip("/").split("/")[-1] or base
 
-    now = datetime.now(timezone.utc)
-    now_epoch = now.timestamp()
-    update_avail = check_update(cfg, now_epoch)
-    tz = datetime.now().astimezone().tzinfo
+
+def gather_cursor(now, tz):
+    """Offline Cursor session/activity rollup from local transcripts + chat meta.
+    Live context fill comes from the statusLine multi-session registry (not
+    transcripts — those have no token/context fields)."""
     today = datetime.now().astimezone(tz).date()
-    window = timedelta(hours=BLOCK_HOURS)
+    sessions = []
+    today_turns = 0
+    today_sessions = set()
+    meta_by_id = {}
 
-    usage = load_usage()
-    data = gather(now, tz)          # incremental, cached — see gather()
+    for meta_path in glob.glob(os.path.join(CURSOR_CHATS, "*", "*", "meta.json")):
+        try:
+            with open(meta_path) as f:
+                m = json.load(f)
+            cid = os.path.basename(os.path.dirname(meta_path))
+            meta_by_id[cid] = m
+        except Exception:
+            continue
+
+    for fp in glob.glob(os.path.join(CURSOR_PROJECTS, "*", "agent-transcripts",
+                                     "*", "*.jsonl")):
+        try:
+            st = os.stat(fp)
+        except OSError:
+            continue
+        sid = os.path.splitext(os.path.basename(fp))[0]
+        parts = fp.split(os.sep)
+        try:
+            i = parts.index("projects")
+            slug = parts[i + 1]
+        except (ValueError, IndexError):
+            slug = "?"
+        users = assistants = 0
+        try:
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"role"' not in line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    role = o.get("role")
+                    if role == "user":
+                        users += 1
+                    elif role == "assistant":
+                        assistants += 1
+        except Exception:
+            continue
+        turns = users + assistants
+        meta = meta_by_id.get(sid) or {}
+        title = meta.get("title") or _cursor_project_slug(slug)
+        cwd = meta.get("cwd")
+        mtime = st.st_mtime
+        local_day = datetime.fromtimestamp(mtime, tz).date()
+        if local_day == today:
+            today_turns += turns
+            today_sessions.add(sid)
+        sessions.append({
+            "id": sid, "title": title, "cwd": cwd, "project": slug,
+            "users": users, "assistants": assistants, "turns": turns,
+            "mtime": mtime,
+        })
+
+    sessions.sort(key=lambda s: -s["mtime"])
+    session_map = load_cursor_session_map()
+    live = load_cursor_live()
+    return {
+        "sessions": sessions,
+        "today_turns": today_turns,
+        "today_sessions": len(today_sessions),
+        "live": live,
+        "session_map": session_map,
+        "n_sessions": len(sessions),
+    }
+
+
+def live_cursor_procs():
+    """How many Cursor CLI agent processes look open (best-effort)."""
+    n = 0
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "cursor-agent|versions/.*/cursor-agent"],
+            text=True, stderr=subprocess.DEVNULL)
+        n = len([ln for ln in out.splitlines() if ln.strip()])
+    except Exception:
+        pass
+    return n
+
+
+def emit_cursor_context_rows(ctx_rows, now_epoch):
+    """CONTEXT · live for Cursor — hottest (most full) first, Claude-style bars."""
+    emit("CONTEXT · live", color=MUTED, sfimage="gauge", header=True)
+    if not ctx_rows:
+        emit("No live context yet", color=MUTED)
+        emit("Wire Cursor statusLine via install.sh", sub=1, color=MUTED)
+        sep()
+        return
+    for _sid, entry, pct in ctx_rows[:CONTEXT_MAX_ROWS]:
+        age = now_epoch - (entry.get("captured_at") or now_epoch)
+        when = "live" if age < CONTEXT_LIVE_MIN * 60 else fmt_age(age)
+        name = cursor_session_label(entry)
+        model = entry.get("model") or ""
+        size = (entry.get("context_window") or {}).get("context_window_size")
+        tok = cursor_ctx_tokens(entry)
+        used_s = f" {compact(tok):>5}/{compact(size)}" if tok and size else ""
+        tier, tags = ctx_tags(tok, pct, size)
+        tail = (" · " + " · ".join(tags)) if tags else ""
+        emit(f"{ellipsis(name, CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
+             f"{render_bar(pct / 100, 6)} {round(pct):>3}%{used_s}"
+             f"{' · ' + model_short(model) if model else ''} · {when}{tail}",
+             color=adaptive(band_color(tier)), size=CONTEXT_TEXT_SIZE)
+    if len(ctx_rows) > CONTEXT_MAX_ROWS:
+        emit(f"+{len(ctx_rows) - CONTEXT_MAX_ROWS} more", color=MUTED,
+             size=CONTEXT_TEXT_SIZE)
+    sep()
+
+
+def emit_cursor_section(cdata, now_epoch, compact_view, ctx_rows=None):
+    """CURSOR provider block: context-rot gauges first, then session activity."""
+    emit("CURSOR", color=MUTED, sfimage="laptopcomputer", header=True)
+    if ctx_rows is None:
+        ctx_rows = fresh_cursor_sessions(cdata.get("session_map") or {}, now_epoch)
+    emit_cursor_context_rows(ctx_rows, now_epoch)
+
+    emit(f"Today       {cdata['today_turns']:>4} turns · "
+         f"{cdata['today_sessions']} sessions")
+    if not compact_view:
+        emit(f"All sessions{cdata['n_sessions']:>4}")
+        procs = live_cursor_procs()
+        if procs:
+            emit(f"Live procs  {procs:>4}")
+        emit("Recent")
+        for s in cdata["sessions"][:8]:
+            age = fmt_age(now_epoch - s["mtime"])
+            label = (s.get("title") or s["project"])[:22]
+            emit(f"{label:<22} {s['turns']:>3}t · {age}", sub=1)
+    else:
+        emit("Recent sessions")
+        for s in cdata["sessions"][:6]:
+            age = fmt_age(now_epoch - s["mtime"])
+            label = (s.get("title") or s["project"])[:22]
+            emit(f"{label:<22} {s['turns']:>3}t · {age}", sub=1)
+    sep()
+
+
+# ─────────────────────────── main ───────────────────────────
+def emit_menubar_title(cfg, usage, cursor_live, cursor_hottest, active_block,
+                       cells, title_size, now_epoch):
+    """Headline: Claude 5h % > hottest Cursor context % > set up / idle.
+    Context rot wins the Cursor slot — show the fullest live window."""
+    five = (usage or {}).get("rate_limits", {}).get("five_hour") if usage else None
+    view = limit_view(five, now_epoch, BLOCK_HOURS * 3600) if five else None
+    if usage and view:
+        extra = ""
+        if cfg["menubar_extra"] == "countdown" and view["remaining"] is not None:
+            extra = f" · {fmt_dur(timedelta(seconds=view['remaining']))}"
+        elif cfg["menubar_extra"] == "tokens" and active_block:
+            extra = f" · {compact(weighted(active_block['tokens']))}"
+        ap = view["pc"]
+        pct = f"~{ap}%" if view["estimated"] else f"{ap}%"
+        print(f"{render_bar(ap / 100, cells)} {pct}{extra} | "
+              f"font={MONO} size={title_size} color={color_for(ap)}")
+        return
+    # Prefer the hottest live Cursor session (context-rot signal).
+    pct = cursor_hottest
+    if pct is None:
+        pct = cursor_ctx_pct(cursor_live or {})
+    if pct is not None:
+        tag = " rot" if pct >= CONTEXT_CRIT_PCT else (
+            " full" if pct >= CONTEXT_WARN_PCT else "")
+        print(f"{render_bar(pct / 100, cells)} ctx {round(pct)}%{tag} | "
+              f"font={MONO} size={title_size} color={color_for(pct)}")
+        return
+    label = "set up" if not usage and not cursor_live else "idle"
+    print(f"{render_bar(0, cells)} {label} | "
+          f"font={MONO} size={title_size} color={MUTED}")
+
+
+def emit_claude_section(cfg, usage, data, now, now_epoch, tz, today, compact_view):
+    """CLAUDE provider block: limits, context, today (+ more stats)."""
+    emit("CLAUDE", color=MUTED, sfimage="bolt.fill", header=True)
+
     all_msgs = data["all_msgs"]
-
-    if all_msgs == 0:
-        if usage:
-            f5 = usage["rate_limits"]["five_hour"]
-            v = limit_view(f5, now_epoch, BLOCK_HOURS * 3600)
-            pct = f"~{v['pc']}%" if v["estimated"] else f"{v['pc']}%"
-            print(f"{render_bar(v['pc'] / 100, cells)} {pct} | "
-                  f"font={MONO} size={title_size} color={color_for(v['pc'])}")
-            sep()
-            emit_live_limits(usage, now_epoch, tz)
-        else:
-            print(f"{render_bar(0, cells)} | font={MONO} size={title_size} color={MUTED}")
-            sep()
-            emit("No Claude Code usage found yet")
-        if update_avail:
-            emit_update(update_avail)
-        emit("Refresh", refresh=True)
-        settings_menu(cfg)
-        emit_version_footer(update_avail)
+    if all_msgs == 0 and not usage:
+        emit("No Claude Code usage found yet", color=MUTED)
+        sep()
         return
 
+    window = timedelta(hours=BLOCK_HOURS)
     all_tok = data["all_tok"]
     by_model_all, by_project = data["by_model"], data["by_project"]
     by_session, hour_profile = data["by_session"], data["hour_profile"]
     by_day = {date.fromisoformat(k): v for k, v in data["by_day"].items()}
     peak = data["peak"]
-
     blocks = build_blocks(sorted(data["recent_records"], key=lambda r: r["ts"]))
 
-    # ── today / week / month from recent records + by-day rollup ──
     month, week_start = today.replace(day=1), today - timedelta(days=6)
     week_w = sum(v[0] for d, v in by_day.items() if d >= week_start)
     month_w = sum(v[0] for d, v in by_day.items() if d >= month)
@@ -1140,56 +1617,30 @@ def main():
             today_hours[lts.hour] += weighted_one(r["u"])
             today_sessions.add(r["session"])
 
-    # ── derived (history only; live limits come from Anthropic) ──
     last = blocks[-1] if blocks else None
     active = last if (last and now - last["start"] < window) else None
     busiest_day = max(by_day.items(), key=lambda kv: kv[1][0]) if by_day else (today, [0.0, 0])
 
-    # ════════════════ MENU BAR TITLE ════════════════
-    # The REAL 5-hour % from Anthropic (live, cross-surface). The optional trailer
-    # is a countdown to reset (default), the token count, or nothing.
-    five = usage["rate_limits"]["five_hour"] if usage else None
-    view = limit_view(five, now_epoch, BLOCK_HOURS * 3600) if five else None
-    extra = ""
-    if cfg["menubar_extra"] == "countdown" and view and view["remaining"] is not None:
-        extra = f" · {fmt_dur(timedelta(seconds=view['remaining']))}"
-    elif cfg["menubar_extra"] == "tokens":
-        extra = f" · {compact(weighted(active['tokens']) if active else 0)}"
-    if usage and view:
-        ap = view["pc"]
-        pct = f"~{ap}%" if view["estimated"] else f"{ap}%"
-        print(f"{render_bar(ap / 100, cells)} {pct}{extra} | "
-              f"font={MONO} size={title_size} color={color_for(ap)}")
-    else:
-        print(f"{render_bar(0, cells)} set up | "
-              f"font={MONO} size={title_size} color={MUTED}")
-    sep()
-
-    if update_avail:
-        emit_update(update_avail)
-
-    # ════════════════ LIVE LIMITS (real, from Anthropic) ════════════════
     if usage:
+        # Context first — knowing you're about to rot matters more than the 5h clock
+        # when you're mid-session; limits follow.
+        emit_context(by_session, now, cfg)
         emit_live_limits(usage, now_epoch, tz)
     else:
+        emit_context(by_session, now, cfg)
         emit("USAGE LIMITS", color=MUTED, sfimage="bolt.fill", header=True)
         emit("Live usage not set up", color=MUTED)
         emit("Run install.sh to show real 5h / 7d limits", sub=1,
              open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
         sep()
 
-    # ════════════════ CONTEXT (live agents) ════════════════
-    emit_context(by_session, now, cfg)
-
-    # Optional: today's git commit count (toggle in Settings, default on). Only
-    # scan the filesystem when it's on — off costs nothing.
     show_commits = cfg["commits"] == "on"
+    commits_today = 0
     if show_commits:
         author = cfg.get("commit_author") or git_identity()
         dirs = [os.path.expanduser(p) for p in (cfg.get("commit_dirs") or [])]
         commits_today = count_commits_today(author, dirs or COMMIT_DIRS_DEFAULT)
 
-    # ════════════════ TODAY ════════════════
     emit("TODAY", color=MUTED, sfimage="calendar", header=True)
     if compact_view:
         commit_tag = ""
@@ -1214,7 +1665,6 @@ def main():
     sep()
 
     if compact_view:
-        # ── compact: tuck the heavy stats behind one submenu ──
         emit("More stats", sfimage="chart.bar.fill")
         emit(f"Week total   {compact(week_w):>8} tok", sub=1)
         emit(f"Month total  {compact(month_w):>8} tok", sub=1)
@@ -1230,11 +1680,78 @@ def main():
                            hour_profile, all_tok, all_msgs, today, tz,
                            week_w, month_w, peak, busiest_day, active, now)
 
+
+def main():
+    global TH, MUTED, PLAN
+    cfg = load_config()
+    TH = THEMES[cfg["theme"]]
+    MUTED = TH["muted"]
+    PLAN = read_plan()
+    cells = cfg["menubar_cells"]
+    title_size = cfg["title_size"]
+    compact_view = cfg["view"] == "compact"
+    prov = active_providers(cfg)
+
+    now = datetime.now(timezone.utc)
+    now_epoch = now.timestamp()
+    update_avail = check_update(cfg, now_epoch)
+    tz = datetime.now().astimezone().tzinfo
+    today = datetime.now().astimezone(tz).date()
+
+    usage = load_usage() if prov["claude"] else None
+    data = gather(now, tz) if prov["claude"] else None
+    cdata = gather_cursor(now, tz) if prov["cursor"] else None
+    cursor_live = (cdata or {}).get("live") if cdata else (
+        load_cursor_live() if prov["cursor"] else None)
+    cursor_rows = fresh_cursor_sessions(
+        (cdata or {}).get("session_map") or (
+            load_cursor_session_map() if prov["cursor"] else {}),
+        now_epoch) if prov["cursor"] else []
+    cursor_hottest = cursor_rows[0][2] if cursor_rows else None
+
+    # Active Claude block (for menubar token trailer)
+    active = None
+    if data and data["all_msgs"]:
+        blocks = build_blocks(sorted(data["recent_records"], key=lambda r: r["ts"]))
+        last = blocks[-1] if blocks else None
+        window = timedelta(hours=BLOCK_HOURS)
+        active = last if (last and now - last["start"] < window) else None
+
+    emit_menubar_title(cfg, usage, cursor_live, cursor_hottest, active,
+                       cells, title_size, now_epoch)
+    sep()
+
+    if update_avail:
+        emit_update(update_avail)
+
+    # Shared context-rot strip — above provider sections so it can't be missed.
+    claude_rows = []
+    if prov["claude"] and data:
+        claude_rows = claude_live_context_rows(data.get("by_session") or {}, now, cfg)
+    risks = collect_context_risks(claude_rows, cursor_rows)
+    emit_context_risk_strip(risks)
+
+    if not prov["claude"] and not prov["cursor"]:
+        emit("No CLI agents detected", color=MUTED)
+        emit("Install Claude Code or Cursor CLI, then Refresh", color=MUTED)
+        sep()
+    if prov["claude"]:
+        emit_claude_section(cfg, usage, data, now, now_epoch, tz, today, compact_view)
+    if prov["cursor"]:
+        emit_cursor_section(cdata or {
+            "sessions": [], "today_turns": 0, "today_sessions": 0,
+            "live": cursor_live, "session_map": {}, "n_sessions": 0},
+            now_epoch, compact_view, ctx_rows=cursor_rows)
+
     settings_menu(cfg)
     sep()
     emit("Refresh", refresh=True, sfimage="arrow.clockwise")
-    emit("Open transcripts folder", sfimage="folder",
-         open_path=os.path.expanduser("~/.claude/projects"))
+    if prov["claude"]:
+        emit("Open Claude transcripts", sfimage="folder",
+             open_path=os.path.expanduser("~/.claude/projects"))
+    if prov["cursor"]:
+        emit("Open Cursor projects", sfimage="folder",
+             open_path=CURSOR_PROJECTS)
     emit_version_footer(update_avail)
 
 
@@ -1349,6 +1866,12 @@ def settings_menu(cfg):
         emit(f"{mark(cfg['update_check']==opt)}{lbl}", sub=1, action=SELF,
              args=["--set", f"update_check={opt}"], refresh=True)
 
+    emit("Providers")
+    for opt, lbl in (("auto", "Auto-detect"), ("claude", "Claude only"),
+                     ("cursor", "Cursor only"), ("both", "Claude + Cursor")):
+        emit(f"{mark(cfg['providers']==opt)}{lbl}", sub=1, action=SELF,
+             args=["--set", f"providers={opt}"], refresh=True)
+
     emit("Commits today")
     for opt, lbl in (("on", "On (your git commits)"), ("off", "Off")):
         emit(f"{mark(cfg['commits']==opt)}{lbl}", sub=1, action=SELF,
@@ -1356,11 +1879,16 @@ def settings_menu(cfg):
 
     # Live-usage status: on when the statusLine bridge has written real data.
     if load_usage():
-        emit("Live usage  connected", color=MUTED)
+        emit("Claude live  connected", color=MUTED)
     else:
-        emit("Live usage  not set up", color=MUTED)
-        emit("Set up live limits (real %, reset times)", sub=1,
+        emit("Claude live  not set up", color=MUTED)
+        emit("Set up Claude live limits", sub=1,
              open_path="https://github.com/dashpes/burnbar#live-usage-real-limits-not-estimates")
+    if load_cursor_live():
+        emit("Cursor live  connected", color=MUTED)
+    else:
+        emit("Cursor live  not set up", color=MUTED)
+        emit("Set up Cursor statusLine (install.sh)", sub=1, color=MUTED)
 
     emit("Edit config file", sub=0, open_path=CONFIG_PATH)
 
