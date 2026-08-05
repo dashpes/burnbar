@@ -284,15 +284,30 @@ is added to the defaults automatically from the registry.
 
 ### Context windows for OpenCode models
 
-OpenCode runs both hosted and local models, so the window is resolved in two
-steps: the models.dev mirror it already caches
+OpenCode runs both hosted and local models, and is the agent people switch models
+in most — so the window is resolved per model, not per session, and re-resolved
+the moment you switch. Two steps: the models.dev mirror it already caches
 (`~/.cache/opencode/models.json` → `provider.models[id].limit.context`) covers
 hosted providers, and for local models — which aren't listed anywhere public —
 burnbar asks whichever runtime loaded them. For Ollama that's
 `http://127.0.0.1:11434/api/ps`, which reports the context length the model was
-actually loaded with. Results are cached for 6 hours in
-`~/.config/burnbar/windows.json`, because the models.dev mirror is ~3.5MB and a
-model's limit effectively never moves.
+actually loaded with. Each row also names the model in play, since a 32K local
+model and a 1M hosted one look nothing alike.
+
+burnbar sizes the window by the session's **currently selected** model, not the
+one that ran the last turn. Switching down doesn't shrink the context you're
+already carrying, so 300K tokens on a 1M model (`30% · degraded`) becomes
+`300K/32K · 100% · rot · compacting` the instant you switch to a 32K local model
+— which is exactly when that warning earns its keep.
+
+Resolved windows are cached in `~/.config/burnbar/windows.json` (the mirror is
+~3.5MB to parse and limits don't move). Two wrinkles that caching has to respect:
+a *miss* expires in two minutes, because `/api/ps` only lists models currently
+loaded and a model you just switched to legitimately isn't there yet; and a
+window that *was* resolved sticks even when the runtime later goes quiet, since
+Ollama unloads idle models and then can't say what window they had — a gap in the
+answer, not a change to it. Sticky isn't stuck: reload with a different `-c` and
+the new size is picked up.
 
 That loopback request goes to a daemon already running on your machine; nothing
 leaves it, and it's skipped entirely when Ollama isn't listening or the model was

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.8.1</bitbar.version>
+# <bitbar.version>1.8.2</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>AI coding agent usage: live burn bar + context-rot tracking + stats.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -877,6 +877,8 @@ def emit_agent_row(r):
     pct_s = f"{round(pct):>3}%" if pct is not None else "   —"
     when = "live" if r["age"] < CONTEXT_LIVE_MIN * 60 else fmt_age(r["age"])
     tail = (" · " + " · ".join(r["tags"])) if r["tags"] else ""
+    if r.get("note"):
+        when = f"{r['note']} · {when}"
     emit(f"{AGENT_LABEL.get(r['prov'], '?'):<8} "
          f"{ellipsis(r['label'], CONTEXT_NAME_W):<{CONTEXT_NAME_W}} "
          f"{bar} {pct_s} "
@@ -1833,6 +1835,11 @@ OPENCODE_MAX_SESSIONS = 20       # newest N sessions are enough to find live one
 # parse) and a model's limit effectively never moves.
 WINDOW_CACHE_PATH = os.path.expanduser("~/.config/burnbar/windows.json")
 WINDOW_CACHE_TTL = 6 * 3600
+# A *miss* must expire quickly. Ollama's /api/ps lists only models it currently has
+# loaded, so switching to a model that hasn't been used yet legitimately misses —
+# and caching that for hours would leave the window unknown long after the model
+# loads. Successes are stable and keep the long TTL.
+WINDOW_MISS_TTL = 120
 OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
 
 
@@ -1902,12 +1909,20 @@ def opencode_window(provider_id, model_id, now_epoch):
     which is honest, and the rot bands work on absolute tokens regardless."""
     key = f"{provider_id}/{model_id}"
     cache = _window_cache()
-    hit = cache.get(key)
-    if isinstance(hit, dict) and now_epoch - (hit.get("at") or 0) < WINDOW_CACHE_TTL:
-        return hit.get("win")
+    hit = cache.get(key) if isinstance(cache.get(key), dict) else {}
+    known = hit.get("win")
+    ttl = WINDOW_CACHE_TTL if known else WINDOW_MISS_TTL
+    if hit and now_epoch - (hit.get("at") or 0) < ttl:
+        return known
     win = models_dev_limit(provider_id, model_id)
     if not win and "ollama" in (provider_id or "").lower():
         win = ollama_context_length(model_id)
+    # A local runtime unloads idle models, and then it can no longer say what
+    # window they had. That's a gap in the answer, not a change to it — the model
+    # reloads with the same context — so a previously resolved size sticks rather
+    # than collapsing the row to "unknown" every time the model goes cold.
+    if not win and known:
+        return known
     _window_cache_put(cache, key, win, now_epoch)
     return win
 
@@ -1951,6 +1966,11 @@ def gather_opencode(now, tz):
             "SELECT COUNT(*) FROM session WHERE time_archived IS NULL").fetchone()[0]
         sessions, today_sessions, today_turns = [], set(), 0
         for r in rows:
+            # session.model is the *currently selected* model, not the one that ran
+            # the last turn: OpenCode rewrites it on every session update. That is
+            # the right one to size the window by — switching to a smaller model
+            # should immediately show the context you're already carrying as over
+            # capacity, which is exactly the moment you need telling.
             try:
                 model = json.loads(r["model"] or "{}")
             except Exception:
@@ -1989,6 +2009,19 @@ def gather_opencode(now, tz):
     return out
 
 
+def opencode_model_label(model_id):
+    """'qwen3.6:latest' -> 'qwen3.6'; 'claude-sonnet-5' -> 'sonnet'.
+
+    OpenCode is the agent people switch models in most, and between very different
+    windows (a 32K local model and a 1M hosted one), so the row names which one is
+    actually in play rather than leaving the window size to imply it."""
+    m = (model_id or "").split("/")[-1]
+    m = m.split(":")[0]
+    if m.startswith("claude-"):
+        return model_short(m)
+    return ellipsis(m, 14)
+
+
 def opencode_session_label(sess):
     if sess.get("title"):
         return sess["title"]
@@ -2015,7 +2048,8 @@ def opencode_agent_rows(pdata, cfg, now_epoch):
                      "label": opencode_session_label(sess),
                      "tok": sess["tok"], "win": win,
                      "pct": min(100.0, 100.0 * sess["tok"] / win) if win else None,
-                     "age": now_epoch - sess["updated"]})
+                     "age": now_epoch - sess["updated"],
+                     "note": opencode_model_label(sess.get("model"))})
     return rows
 
 

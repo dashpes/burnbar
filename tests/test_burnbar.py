@@ -957,3 +957,96 @@ class TestWindowResolution(unittest.TestCase):
             self.assertEqual(bb.opencode_window("ollama", "qwen3.6:latest",
                                                 1_000_000), 32_768)
             mdev.assert_not_called()
+
+
+class TestModelSwitching(unittest.TestCase):
+    """OpenCode is where models get switched most, and between wildly different
+    windows — a 32K local model and a 1M hosted one. These pin what happens."""
+
+    NOW = 1_000_000
+
+    def session(self, model, provider, win, tok=300_000):
+        return {"sessions": [{"id": "s", "title": "mixed", "tok": tok,
+                              "updated": self.NOW, "win": win,
+                              "model": model, "provider": provider}]}
+
+    def row(self, pdata):
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            return bb.unified_agent_rows(
+                bb.opencode_agent_rows(pdata, dict(bb.DEFAULTS), self.NOW))[0]
+
+    def test_switching_to_a_smaller_model_shows_over_capacity_at_once(self):
+        """The context you're already carrying doesn't shrink when you switch, so
+        moving from a 1M model to a 32K one has to read as a five-alarm fire — that
+        is precisely the moment the warning is worth something."""
+        big = self.row(self.session("claude-sonnet-5", "anthropic", 1_000_000))
+        self.assertAlmostEqual(big["pct"], 30, places=0)
+        self.assertEqual(big["tier"], 2)                      # degraded
+        small = self.row(self.session("qwen3.6:latest", "ollama", 32_768))
+        self.assertEqual(small["pct"], 100.0)                 # clamped, not >100
+        self.assertEqual(small["tier"], 3)                    # rot
+        self.assertIn("compacting", small["tags"])
+
+    def test_row_names_the_model_in_play(self):
+        self.assertEqual(self.row(self.session("qwen3.6:latest", "ollama",
+                                               32_768))["note"], "qwen3.6")
+        self.assertEqual(self.row(self.session("claude-sonnet-5", "anthropic",
+                                               1_000_000))["note"], "sonnet")
+
+    def test_model_label_strips_tags_and_paths(self):
+        self.assertEqual(bb.opencode_model_label("qwen3.6:latest"), "qwen3.6")
+        self.assertEqual(bb.opencode_model_label("qwen/qwen3.6-flash"), "qwen3.6-flash")
+        self.assertEqual(bb.opencode_model_label("claude-opus-5"), "opus")
+        self.assertEqual(bb.opencode_model_label(""), "")
+
+
+class TestWindowCacheAcrossSwitches(unittest.TestCase):
+    """The window cache has to survive model switching, which means distinguishing
+    "this model has no known window" from "the runtime can't answer right now"."""
+
+    NOW = 1_000_000
+
+    @contextlib.contextmanager
+    def cache(self, initial=None):
+        store = dict(initial or {})
+        with mock.patch.object(bb, "_window_cache", lambda: store), \
+                mock.patch.object(
+                    bb, "_window_cache_put",
+                    lambda c, k, w, t: store.__setitem__(k, {"win": w, "at": t})):
+            yield store
+
+    def test_a_miss_expires_quickly(self):
+        """Ollama's /api/ps lists only *loaded* models, so switching to one that
+        hasn't run yet legitimately misses. Caching that for hours would leave the
+        window unknown long after the model loads."""
+        self.assertLess(bb.WINDOW_MISS_TTL, bb.WINDOW_CACHE_TTL / 10)
+        with self.cache({"ollama/m": {"win": None, "at": self.NOW}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length",
+                                      return_value=32_768):
+                stale = self.NOW + bb.WINDOW_MISS_TTL + 1
+                self.assertEqual(bb.opencode_window("ollama", "m", stale), 32_768)
+
+    def test_a_known_window_survives_the_model_going_cold(self):
+        """A local runtime unloads idle models and then can't say what window they
+        had. That's a gap in the answer, not a change to it."""
+        with self.cache({"ollama/m": {"win": 32_768, "at": 0}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length", return_value=None):
+                self.assertEqual(bb.opencode_window("ollama", "m", self.NOW), 32_768)
+
+    def test_a_reloaded_model_can_still_change_the_window(self):
+        """Sticky must not mean stuck: reload with a different -c and it updates."""
+        with self.cache({"ollama/m": {"win": 32_768, "at": 0}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length",
+                                      return_value=131_072):
+                self.assertEqual(bb.opencode_window("ollama", "m", self.NOW), 131_072)
+
+    def test_each_model_is_cached_separately(self):
+        """Switching models must not read the previous model's window."""
+        with self.cache({"ollama/a": {"win": 32_768, "at": self.NOW}}) as store:
+            with mock.patch.object(bb, "models_dev_limit", return_value=200_000):
+                self.assertEqual(bb.opencode_window("anthropic", "b", self.NOW),
+                                 200_000)
+            self.assertEqual(store["ollama/a"]["win"], 32_768)
