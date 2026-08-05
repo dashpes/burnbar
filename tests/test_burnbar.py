@@ -85,13 +85,30 @@ class TestContextWindow(unittest.TestCase):
         self.assertEqual(bb.context_window("claude-opus-4-8", 0, "200k"), bb.CTX_200K)
         self.assertEqual(bb.context_window("claude-sonnet-4-6", 0, "1m"), bb.CTX_1M)
 
-    def test_auto(self):
-        # Opus is the 1M-context model
-        self.assertEqual(bb.context_window("claude-opus-4-8", 0, "auto"), bb.CTX_1M)
-        # everything else is 200K...
+    def test_reported_window_wins(self):
+        """What Claude Code says the window is beats any guess — it is the only
+        source that can be right, and it follows a /model switch on its own."""
+        self.assertEqual(
+            bb.context_window("claude-opus-5", 0, "auto", reported=1_000_000),
+            1_000_000)
+        self.assertEqual(
+            bb.context_window("claude-opus-5[1m]", 0, "auto", reported=200_000),
+            200_000)
+
+    def test_explicit_pin_beats_even_the_reported_window(self):
+        self.assertEqual(
+            bb.context_window("claude-opus-5", 0, "200k", reported=1_000_000),
+            bb.CTX_200K)
+
+    def test_auto_guesses_conservatively_without_a_bridge(self):
+        """Claude Code exposes "claude-opus-5" and "claude-opus-5[1m]" as separate
+        models, so only the suffix (or a demonstrated high-water mark) proves 1M.
+        Guessing high would hide rot; guessing low only warns early."""
+        self.assertEqual(bb.context_window("claude-opus-5[1m]", 0, "auto"), bb.CTX_1M)
+        self.assertEqual(bb.context_window("claude-opus-5", 0, "auto"), bb.CTX_200K)
         self.assertEqual(bb.context_window("claude-sonnet-4-6", 1000, "auto"),
                          bb.CTX_200K)
-        # ...unless it has somehow crossed 200K (1M-beta Sonnet) -> high-water wins
+        # a session that has provably exceeded 200K must be sized above it
         self.assertEqual(bb.context_window("claude-sonnet-4-6", bb.CTX_200K + 1,
                                            "auto"), bb.CTX_1M)
 
@@ -362,7 +379,7 @@ class TestUnifiedAgentRows(unittest.TestCase):
 
     def test_providers_are_merged_and_tagged(self):
         rows = self.rows(
-            mains=[("s1", {"model": "claude-opus-5", "last_ctx": 300_000,
+            mains=[("s1", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
                            "peak_ctx": 300_000, "mtime": self.NOW, "title": "C"})],
             cursor=[self.cursor_entry("X", 65)])
         self.assertEqual({r["prov"] for r in rows}, {"claude", "cursor"})
@@ -376,7 +393,7 @@ class TestUnifiedAgentRows(unittest.TestCase):
         Cursor session carries fewer tokens but is judged against a smaller window,
         so it outranks the roomy 1M Claude session."""
         rows = self.rows(
-            mains=[("s1", {"model": "claude-opus-5", "last_ctx": 300_000,
+            mains=[("s1", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
                            "peak_ctx": 300_000, "mtime": self.NOW, "title": "Roomy"})],
             cursor=[self.cursor_entry("Hot", 90, size=200_000)])
         self.assertEqual([r["label"] for r in rows], ["Hot", "Roomy"])
@@ -387,7 +404,7 @@ class TestUnifiedAgentRows(unittest.TestCase):
         """A session is at risk for either reason, and they don't have to agree:
         quality decay (tokens past the band) or imminent compaction (% of window)."""
         rows = self.rows(mains=[
-            ("deep", {"model": "claude-opus-5", "last_ctx": 300_000,
+            ("deep", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
                       "peak_ctx": 300_000, "mtime": self.NOW, "title": "deep"}),
             ("full", {"model": "claude-sonnet-5", "last_ctx": 150_000,
                       "peak_ctx": 150_000, "mtime": self.NOW, "title": "full"}),

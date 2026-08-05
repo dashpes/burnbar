@@ -144,12 +144,22 @@ def main():
     # (API-key user, or a blob without them) is still an open session worth showing.
     try:
         workspace = data.get("workspace") or {}
+        ctx = data.get("context_window") or {}
         merge_session({
             "captured_at": now_i,
             "session_id": data.get("session_id"),
             "cwd": data.get("cwd") or workspace.get("current_dir"),
             "transcript_path": data.get("transcript_path"),
             "model": model,
+            "model_id": (data.get("model") or {}).get("id"),
+            # The window Claude Code is actually giving this session. It is the only
+            # reliable source: the transcript never records a size, and the model id
+            # can't be mapped to one: Claude Code exposes "claude-opus-5" (200K)
+            # and "claude-opus-5[1m]" (1M) as separate models of the same
+            # underlying one, so any name-based guess is wrong for one of them.
+            # Follows a /model switch on the next UI update, for free.
+            "context_window_size": ctx.get("context_window_size"),
+            "context_tokens": ctx.get("total_input_tokens"),
         }, now_i)
     except Exception:
         pass

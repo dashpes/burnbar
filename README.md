@@ -304,10 +304,23 @@ tell it, and an em dash (`—`) with a dashed bar when nothing can — never `0%
 which would read as "plenty of room left". The context-rot band still applies
 either way, since that reads absolute tokens rather than a percentage.
 
-Claude Code's transcripts don't record the window *size*, so `Auto-detect` goes
-by the model running the latest turn: Opus is the 1M-context model, so an Opus
-session is sized to 1M; Haiku/Sonnet sessions use the standard 200K (with a
-fallback to 1M for anything that's somehow crossed 200K). If you run a fixed
+### Context windows for Claude models
+
+Claude Code reports the exact window it has given each session (`context_window.
+context_window_size` in the statusLine payload), and the bridge records it — so
+the number is right, and it **follows a `/model` switch on its own** with no
+lookup table to keep current.
+
+This matters more than it sounds. Claude Code exposes `claude-opus-5` and
+`claude-opus-5[1m]` as *separate* models of the same underlying one, with
+different windows, so no name-based guess can be right for both. A public model
+table doesn't help either: it lists what a model is capable of, not what Claude
+Code hands this session.
+
+Without the bridge there's nothing but the name, so `Auto-detect` guesses
+conservatively — the `[1m]` suffix means 1M, a session whose own high-water mark
+has passed 200K is clearly bigger than that, and anything else is assumed 200K.
+Guessing high would hide rot; guessing low only warns early. If you run a fixed
 setup, pin it to `200K` or `1M` in Settings.
 
 Cache-read tokens are down-weighted (`CACHE_READ_WEIGHT = 0.1`) in the Claude

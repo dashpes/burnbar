@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>burnbar</bitbar.title>
-# <bitbar.version>1.8.0</bitbar.version>
+# <bitbar.version>1.8.1</bitbar.version>
 # <bitbar.author>burnbar</bitbar.author>
 # <bitbar.desc>AI coding agent usage: live burn bar + context-rot tracking + stats.</bitbar.desc>
 # <bitbar.dependencies>python3</bitbar.dependencies>
@@ -360,18 +360,30 @@ def fmt_age(secs):
     return f"{h}h{rm:02d}m" if rm else f"{h}h"
 
 
-def context_window(model, peak_ctx, mode):
-    """Pick a session's context-window size. 'auto' goes by the model running the
-    latest turn — Opus is the 1M-context model, everything else is the standard
-    200K — and falls back to the high-water mark for any non-Opus session that has
-    somehow crossed 200K (e.g. a 1M-beta Sonnet)."""
+def context_window(model, peak_ctx, mode, reported=None):
+    """Pick a session's context-window size.
+
+    `reported` is what Claude Code itself said the window is (via the statusLine
+    bridge) and always wins outside an explicit pin, because it is the only source
+    that can be right: transcripts never record a size, and the model name can't
+    be mapped to one — Claude Code offers "claude-opus-5" (200K) and
+    "claude-opus-5[1m]" (1M) as separate models of the same underlying one. It
+    also follows a /model switch on its own.
+
+    Without a bridge there is nothing to go on but the name, so 'auto' guesses
+    conservatively: the [1m] suffix marks a 1M variant, and a session whose own
+    high-water mark has passed 200K has demonstrably got more than that. Anything
+    else is assumed 200K. Deliberately not "opus means 1M" — a models.dev-style
+    table lists what a model can do, not what Claude Code hands this session, and
+    guessing high hides rot, while guessing low only warns early."""
     if mode == "200k":
         return CTX_200K
     if mode == "1m":
         return CTX_1M
-    if "opus" in (model or "").lower() or peak_ctx > CTX_200K:
-        return CTX_1M
-    return CTX_200K
+    if reported:
+        return int(reported)
+    name = (model or "").lower()
+    return CTX_1M if ("[1m]" in name or peak_ctx > CTX_200K) else CTX_200K
 
 
 def ctx_label(win):
@@ -610,13 +622,10 @@ def fresh_cursor_sessions(session_map, now_epoch, stale_min=CURSOR_CTX_STALE_MIN
     return rows
 
 
-def claude_registry_sessions(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
-    """[(session_id, last_seen)] the Claude statusLine bridge refreshed within
-    stale_min, newest first — or None if there's no registry to answer.
-
-    None means "unknown, go guess" (the pgrep/lsof path). It is deliberately not
-    the same as an empty list, which means "the bridge is running and reports
-    nothing open"."""
+def claude_registry(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
+    """{session_id: entry} for sessions the bridge refreshed within stale_min, or
+    None if there's no registry to answer. Each entry carries the heartbeat plus
+    whatever Claude Code reported — notably the exact context window size."""
     try:
         with open(CLAUDE_SESSIONS_PATH) as f:
             store = json.load(f)
@@ -626,8 +635,20 @@ def claude_registry_sessions(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
     if not isinstance(sessions, dict):
         return None
     cut = now_epoch - stale_min * 60
-    rows = [(sid, v.get("captured_at") or 0) for sid, v in sessions.items()
-            if isinstance(v, dict) and (v.get("captured_at") or 0) >= cut]
+    return {sid: v for sid, v in sessions.items()
+            if isinstance(v, dict) and (v.get("captured_at") or 0) >= cut}
+
+
+def claude_registry_sessions(now_epoch, stale_min=CLAUDE_CTX_STALE_MIN):
+    """[(session_id, last_seen)] from the registry, newest first — or None.
+
+    None means "unknown, go guess" (the pgrep/lsof path). It is deliberately not
+    the same as an empty list, which means "the bridge is running and reports
+    nothing open"."""
+    reg = claude_registry(now_epoch, stale_min)
+    if reg is None:
+        return None
+    rows = [(sid, v.get("captured_at") or 0) for sid, v in reg.items()]
     rows.sort(key=lambda r: -r[1])
     return rows
 
@@ -795,9 +816,12 @@ def collect_context_risks(claude_rows, cursor_rows, warn=CONTEXT_WARN_PCT):
 def claude_agent_rows(pdata, cfg, now_epoch):
     """Claude's contribution to the agent list: one row per live main session."""
     mode = cfg["context_window"]
+    reg = (pdata or {}).get("registry") or {}
     rows = []
     for key, sv in (pdata or {}).get("mains", []):
-        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode)
+        entry = reg.get(sv.get("sid")) or reg.get(key) or {}
+        win = context_window(sv.get("model"), sv.get("peak_ctx", 0), mode,
+                             entry.get("context_window_size"))
         used = sv.get("last_ctx", 0)
         rows.append({"prov": "claude", "key": key, "label": ctx_session_label(sv),
                      "tok": used, "win": win,
@@ -2086,7 +2110,8 @@ def gather_claude(now, tz):
     data = gather(now, tz)
     mains, by_parent = claude_live_agents(data.get("by_session") or {}, now,
                                           load_config())
-    return {"data": data, "usage": usage, "mains": mains, "by_parent": by_parent}
+    return {"data": data, "usage": usage, "mains": mains, "by_parent": by_parent,
+            "registry": claude_registry(now.timestamp()) or {}}
 
 
 def claude_today_line(pdata):
