@@ -18,13 +18,13 @@ machine. (The lone exception: an optional once-a-day check to GitHub for a newer
 version — it sends nothing about you, and it's one toggle away in Settings.)
 
 <p align="center">
-  <img src="docs/demo.gif" alt="burnbar demo" width="400">
+  <img src="docs/demo.gif" alt="burnbar demo" width="560">
 </p>
 
 <p align="center">
-  <img src="docs/screenshot-compact.png" alt="burnbar dropdown" width="370">
+  <img src="docs/dropdown.png" alt="burnbar dropdown" width="350">
   &nbsp;&nbsp;
-  <img src="docs/screenshot.png" alt="burnbar Stats submenu" width="370">
+  <img src="docs/stats.png" alt="burnbar Stats submenu" width="388">
 </p>
 <p align="center"><em>The dropdown (left) and the Stats submenu (right).</em></p>
 
@@ -33,9 +33,9 @@ everything else one hover away:
 
 - **LIVE AGENTS** — every running session from every provider in *one* list,
   worst context first, each row naming its provider (plus an SF Symbol: ⚡ Claude,
-  ↖ Cursor). Subagents nest under the session that spawned them. Bar *length* is
-  window fill; bar *colour* is the rot band — they're independent signals and
-  they're meant to be able to disagree.
+  ↖ Cursor, `</>` OpenCode). Subagents nest under the session that spawned them.
+  Bar *length* is window fill; bar *colour* is the rot band — they're independent
+  signals and they're meant to be able to disagree.
 - **LIMITS** — the real cross-surface 5-hour / 7-day / Opus limits from Anthropic
   (via the statusLine bridge), with the reset countdown
 - **TODAY** — tokens, messages and sessions per provider, your git commit count,
