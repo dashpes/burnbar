@@ -3,11 +3,17 @@
 Deliberately small and dependency-free (stdlib unittest): they cover the bits
 that have actually bitten us — version parsing (broke the release), the live-
 session tier selection (showed closed sessions as live) — plus the token/format
-helpers. Run with:  python3 -m unittest discover -s tests
+helpers and multi-provider detection. Run with:  python3 -m unittest discover -s tests
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
+import tempfile
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
 # The plugin's filename ('burnbar.30s.py') isn't a valid module name, so load it
 # by path. Importing only runs module-level constants + a self-version read; no
@@ -42,6 +48,16 @@ class TestVersion(unittest.TestCase):
         self.assertIsNone(bb.parse_version_header("no header here"))
         self.assertIsNone(bb.parse_version_header(None))
 
+    def test_plugin_version_comes_from_the_header(self):
+        """VERSION must be the parsed <bitbar.version>, never the "0.0.0" fallback —
+        that fallback would make every install look older than the latest release and
+        nag forever. Asserting the invariant, not a literal, so a release bump is a
+        one-line change to the header alone (which CI already gates)."""
+        self.assertRegex(bb.VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertNotEqual(bb.VERSION, "0.0.0")
+        with open(bb.SELF, encoding="utf-8") as f:
+            self.assertEqual(bb.VERSION, bb.parse_version_header(f.read(2048)))
+
 
 class TestFormatting(unittest.TestCase):
     def test_compact(self):
@@ -69,13 +85,30 @@ class TestContextWindow(unittest.TestCase):
         self.assertEqual(bb.context_window("claude-opus-4-8", 0, "200k"), bb.CTX_200K)
         self.assertEqual(bb.context_window("claude-sonnet-4-6", 0, "1m"), bb.CTX_1M)
 
-    def test_auto(self):
-        # Opus is the 1M-context model
-        self.assertEqual(bb.context_window("claude-opus-4-8", 0, "auto"), bb.CTX_1M)
-        # everything else is 200K...
+    def test_reported_window_wins(self):
+        """What Claude Code says the window is beats any guess — it is the only
+        source that can be right, and it follows a /model switch on its own."""
+        self.assertEqual(
+            bb.context_window("claude-opus-5", 0, "auto", reported=1_000_000),
+            1_000_000)
+        self.assertEqual(
+            bb.context_window("claude-opus-5[1m]", 0, "auto", reported=200_000),
+            200_000)
+
+    def test_explicit_pin_beats_even_the_reported_window(self):
+        self.assertEqual(
+            bb.context_window("claude-opus-5", 0, "200k", reported=1_000_000),
+            bb.CTX_200K)
+
+    def test_auto_guesses_conservatively_without_a_bridge(self):
+        """Claude Code exposes "claude-opus-5" and "claude-opus-5[1m]" as separate
+        models, so only the suffix (or a demonstrated high-water mark) proves 1M.
+        Guessing high would hide rot; guessing low only warns early."""
+        self.assertEqual(bb.context_window("claude-opus-5[1m]", 0, "auto"), bb.CTX_1M)
+        self.assertEqual(bb.context_window("claude-opus-5", 0, "auto"), bb.CTX_200K)
         self.assertEqual(bb.context_window("claude-sonnet-4-6", 1000, "auto"),
                          bb.CTX_200K)
-        # ...unless it has somehow crossed 200K (1M-beta Sonnet) -> high-water wins
+        # a session that has provably exceeded 200K must be sized above it
         self.assertEqual(bb.context_window("claude-sonnet-4-6", bb.CTX_200K + 1,
                                            "auto"), bb.CTX_1M)
 
@@ -141,6 +174,15 @@ class TestSelectLiveMains(unittest.TestCase):
         mains = bb.select_live_mains(cand, 2, {"/x": 1, "/y": 1}, self.now)
         self.assertEqual(self.keys(mains), ["a", "c"])  # newest in /x, plus /y
 
+    def test_precise_budget_still_gates_on_recency(self):
+        """The bug this fixes: two processes in one directory handed a slot to the
+        next-newest transcript, so a session closed an hour ago kept showing as a
+        live agent. A live process proves *some* session there is open, never which."""
+        cand = [("fresh", _sv(self.now - 10)),
+                ("dead", _sv(self.now - bb.CLAUDE_CTX_STALE_MIN * 60 - 1))]
+        mains = bb.select_live_mains(cand, 2, {"/work": 2}, self.now)
+        self.assertEqual(self.keys(mains), ["fresh"])
+
     def test_count_only_caps_and_recency_gates(self):
         # lsof blocked: we know 2 procs exist but not where. s3 (60m) is too old.
         mains = bb.select_live_mains(self.cand, 2, None, self.now)
@@ -195,5 +237,816 @@ class TestLimitView(unittest.TestCase):
         self.assertEqual(v["pc"], 0)
 
 
+class TestProviders(unittest.TestCase):
+    def cfg(self, legacy):
+        c = dict(bb.DEFAULTS, providers=legacy)
+        bb.migrate_providers(c)
+        return c
+
+    def test_active_providers_modes(self):
+        active = bb.active_providers(self.cfg("claude"))
+        self.assertTrue(active["claude"])
+        self.assertFalse(active["cursor"])
+        # A legacy pin was exhaustive, so agents added later must stay off.
+        self.assertFalse(any(v for k, v in active.items() if k != "claude"))
+        active = bb.active_providers(self.cfg("cursor"))
+        self.assertTrue(active["cursor"])
+        self.assertFalse(active["claude"])
+        active = bb.active_providers(self.cfg("both"))
+        self.assertTrue(active["claude"] and active["cursor"])
+
+    def test_auto_uses_detect(self):
+        with mock.patch.object(bb, "detect_claude", return_value=True), \
+             mock.patch.object(bb, "detect_cursor", return_value=False):
+            active = bb.active_providers(self.cfg("auto"))
+            self.assertTrue(active["claude"])
+            self.assertFalse(active["cursor"])
+
+    def test_cursor_project_slug(self):
+        self.assertEqual(bb._cursor_project_slug("Users-me-Dev-burnbar"), "burnbar")
+
+
+class TestGatherCursor(unittest.TestCase):
+    def test_gather_from_fixtures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "projects", "Users-me-Dev-app")
+            sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            txdir = os.path.join(proj, "agent-transcripts", sid)
+            os.makedirs(txdir)
+            tx = os.path.join(txdir, f"{sid}.jsonl")
+            with open(tx, "w") as f:
+                f.write(json.dumps({"role": "user", "message": {"content": []}}) + "\n")
+                f.write(json.dumps({"role": "assistant",
+                                    "message": {"content": []}}) + "\n")
+            chats = os.path.join(tmp, "chats", "hash", sid)
+            os.makedirs(chats)
+            with open(os.path.join(chats, "meta.json"), "w") as f:
+                json.dump({"title": "Fixture Chat", "cwd": "/tmp/app"}, f)
+            live = os.path.join(tmp, "live.json")
+            with open(live, "w") as f:
+                json.dump({
+                    "captured_at": 1_000_000,
+                    "session_id": sid,
+                    "session_name": "Fixture Chat",
+                    "model": "Auto",
+                    "context_window": {"used_percentage": 42,
+                                       "context_window_size": 200000},
+                }, f)
+
+            old_proj = bb.CURSOR_PROJECTS
+            old_chats = bb.CURSOR_CHATS
+            old_live = bb.CURSOR_LIVE_PATH
+            bb.CURSOR_PROJECTS = os.path.join(tmp, "projects")
+            bb.CURSOR_CHATS = os.path.join(tmp, "chats")
+            bb.CURSOR_LIVE_PATH = live
+            try:
+                data = bb.gather_cursor(datetime.now(timezone.utc), timezone.utc)
+            finally:
+                bb.CURSOR_PROJECTS = old_proj
+                bb.CURSOR_CHATS = old_chats
+                bb.CURSOR_LIVE_PATH = old_live
+
+            self.assertEqual(data["n_sessions"], 1)
+            self.assertEqual(data["sessions"][0]["title"], "Fixture Chat")
+            self.assertEqual(data["sessions"][0]["turns"], 2)
+            self.assertEqual(data["live"]["context_window"]["used_percentage"], 42)
+
+
+class TestContextRisk(unittest.TestCase):
+    def test_fresh_cursor_sessions_sorts_hottest_first(self):
+        now = 1_000_000
+        smap = {
+            "a": {"captured_at": now - 10, "session_name": "cool",
+                  "context_window": {"used_percentage": 20}},
+            "b": {"captured_at": now - 5, "session_name": "hot",
+                  "context_window": {"used_percentage": 88}},
+            "c": {"captured_at": now - 9999, "session_name": "stale",
+                  "context_window": {"used_percentage": 99}},
+        }
+        rows = bb.fresh_cursor_sessions(smap, now, stale_min=30)
+        self.assertEqual([r[0] for r in rows], ["b", "a"])
+        self.assertEqual(rows[0][2], 88)
+
+    def test_collect_context_risks(self):
+        claude = [("Sess A", 72.0, 144_000, 200_000, {}),
+                  ("Sess B", 40.0, 8_000, 200_000, {})]
+        cursor = [("c1", {"session_name": "Cursor Hot",
+                          "context_window": {"used_percentage": 90,
+                                             "context_window_size": 200_000}}, 90.0)]
+        risks = bb.collect_context_risks(claude, cursor, warn=70)
+        self.assertEqual(len(risks), 2)
+        # Both rot on 200K bands; 180K beats 144K. Sess B (8K, 40%) isn't at risk.
+        self.assertEqual(risks[0][0], "Cursor")
+        self.assertEqual(risks[0][2], 90)
+        self.assertEqual(risks[1][0], "Claude")
+
+    def test_risk_ranks_by_tier_then_tokens(self):
+        """A smaller session judged against a smaller window can be further gone:
+        150K/200K is rot, 300K/1M only degraded, so the 150K one leads despite
+        carrying half the tokens."""
+        claude = [("Opus 1M", 30.0, 300_000, 1_000_000, {}),
+                  ("Small", 75.0, 150_000, 200_000, {})]
+        risks = bb.collect_context_risks(claude, [], warn=70)
+        self.assertEqual([r[1] for r in risks], ["Small", "Opus 1M"])
+        self.assertEqual(risks[0][4], 3)
+        self.assertEqual(risks[1][4], 2)
+
+    def test_low_percentage_high_tokens_is_flagged(self):
+        """A 1M session at 30% would never trip a %-based threshold, but 300K is
+        past the 1M-class 'degraded' floor, so it still surfaces."""
+        risks = bb.collect_context_risks(
+            [("Roomy", 30.0, 300_000, 1_000_000, {})], [], warn=70)
+        self.assertEqual(len(risks), 1)
+        self.assertIn("degraded", risks[0][5])
+
+
+class TestUnifiedAgentRows(unittest.TestCase):
+    """The merged LIVE AGENTS list — one list for every provider, replacing the
+    three places context used to be printed."""
+
+    NOW = 1_000_000
+
+    def rows(self, mains=(), cursor=()):
+        cfg = dict(bb.DEFAULTS)
+        return bb.unified_agent_rows(
+            bb.claude_agent_rows({"mains": list(mains)}, cfg, self.NOW)
+            + bb.cursor_agent_rows({"ctx_rows": list(cursor)}, cfg, self.NOW))
+
+    def cursor_entry(self, name, pct, size=256_000, age=60):
+        return (name, {"session_name": name, "captured_at": self.NOW - age,
+                       "context_window": {"used_percentage": pct,
+                                          "context_window_size": size}}, float(pct))
+
+    def test_providers_are_merged_and_tagged(self):
+        rows = self.rows(
+            mains=[("s1", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
+                           "peak_ctx": 300_000, "mtime": self.NOW, "title": "C"})],
+            cursor=[self.cursor_entry("X", 65)])
+        self.assertEqual({r["prov"] for r in rows}, {"claude", "cursor"})
+        # Every row must resolve to an icon — that's the only provider cue, since
+        # colour is already carrying the rot band.
+        for r in rows:
+            self.assertIn(r["prov"], bb.AGENT_ICON)
+
+    def test_ranked_by_rot_tier_then_tokens(self):
+        """Same ordering the old risk strip used: how degraded beats how big. The
+        Cursor session carries fewer tokens but is judged against a smaller window,
+        so it outranks the roomy 1M Claude session."""
+        rows = self.rows(
+            mains=[("s1", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
+                           "peak_ctx": 300_000, "mtime": self.NOW, "title": "Roomy"})],
+            cursor=[self.cursor_entry("Hot", 90, size=200_000)])
+        self.assertEqual([r["label"] for r in rows], ["Hot", "Roomy"])
+        self.assertEqual(rows[0]["tier"], 3)      # 180K on 200K bands -> rot
+        self.assertEqual(rows[1]["tier"], 2)      # 300K on 1M bands   -> degraded
+
+    def test_at_risk_flags_both_independent_signals(self):
+        """A session is at risk for either reason, and they don't have to agree:
+        quality decay (tokens past the band) or imminent compaction (% of window)."""
+        rows = self.rows(mains=[
+            ("deep", {"model": "claude-opus-5[1m]", "last_ctx": 300_000,
+                      "peak_ctx": 300_000, "mtime": self.NOW, "title": "deep"}),
+            ("full", {"model": "claude-sonnet-5", "last_ctx": 150_000,
+                      "peak_ctx": 150_000, "mtime": self.NOW, "title": "full"}),
+            ("calm", {"model": "claude-sonnet-5", "last_ctx": 5_000,
+                      "peak_ctx": 5_000, "mtime": self.NOW, "title": "calm"}),
+        ])
+        flagged = {r["label"]: r["at_risk"] for r in rows}
+        self.assertTrue(flagged["deep"])   # 30% of 1M, but degraded on tokens
+        self.assertTrue(flagged["full"])   # 75% of 200K, compaction near
+        self.assertFalse(flagged["calm"])
+
+    def test_cursor_rows_capped(self):
+        rows = self.rows(cursor=[self.cursor_entry(f"s{i}", 50)
+                                 for i in range(bb.CONTEXT_MAX_ROWS + 4)])
+        self.assertEqual(len(rows), bb.CONTEXT_MAX_ROWS)
+
+    def test_missing_cursor_window_size_does_not_crash(self):
+        """Cursor omits context_window_size on some builds; the row must still
+        render (no window label, banded against the default floors)."""
+        rows = self.rows(cursor=[("s", {"session_name": "s",
+                                        "captured_at": self.NOW,
+                                        "context_window": {"used_percentage": 80}},
+                                  80.0)])
+        self.assertIsNone(rows[0]["win"])
+        self.assertTrue(rows[0]["at_risk"])
+
+
+class TestClaudeLiveAgents(unittest.TestCase):
+    def by_session(self, ts):
+        return {
+            "main1": {"last_ctx": 1000, "mtime": ts, "cwd": "/w", "agent": False,
+                      "sid": "main1"},
+            "agent-a": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
+                        "sid": "main1", "agent_id": "aaaa"},
+            # Parent isn't among the live mains -> orphan bucket.
+            "agent-b": {"last_ctx": 500, "mtime": ts, "cwd": "/w", "agent": True,
+                        "sid": "ghost", "agent_id": "bbbb"},
+        }
+
+    def test_subagents_attach_to_parent_and_orphans_go_to_none(self):
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids", return_value=None), \
+                mock.patch.object(bb, "live_session_cwds",
+                                  return_value=(1, {"/w": 1})):
+            mains, by_parent = bb.claude_live_agents(
+                self.by_session(now.timestamp()), now, dict(bb.DEFAULTS))
+        self.assertEqual([k for k, _ in mains], ["main1"])
+        self.assertEqual([k for k, _ in by_parent["main1"]], ["agent-a"])
+        self.assertEqual([k for k, _ in by_parent[None]], ["agent-b"])
+
+    def test_registry_identifies_sessions_and_skips_the_process_probe(self):
+        """With the bridge registry present we know *which* sessions are open, so
+        the expensive pgrep+lsof probe must not run at all."""
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids",
+                               return_value={"main1"}), \
+                mock.patch.object(bb, "live_session_cwds") as probe:
+            mains, by_parent = bb.claude_live_agents(
+                self.by_session(now.timestamp()), now, dict(bb.DEFAULTS))
+        probe.assert_not_called()
+        self.assertEqual([k for k, _ in mains], ["main1"])
+        self.assertEqual([k for k, _ in by_parent["main1"]], ["agent-a"])
+        self.assertNotIn(None, by_parent)   # agent-b's parent isn't live
+
+    def test_registry_saying_nothing_is_open_hides_everything(self):
+        """An empty set is an answer ("bridge is running, nothing is open"), not the
+        absence of one — it must not fall through to the guessing path."""
+        now = datetime.now(timezone.utc)
+        with mock.patch.object(bb, "live_claude_session_ids", return_value=set()), \
+                mock.patch.object(bb, "live_session_cwds") as probe:
+            mains, _ = bb.claude_live_agents(self.by_session(now.timestamp()), now,
+                                             dict(bb.DEFAULTS))
+        probe.assert_not_called()
+        self.assertEqual(mains, [])
+
+    def test_no_sessions_short_circuits_before_shelling_out(self):
+        """The process probe is the expensive call; it must not run when there's
+        nothing that could be displayed."""
+        with mock.patch.object(bb, "live_session_cwds") as probe:
+            self.assertEqual(bb.claude_live_agents({}, datetime.now(timezone.utc),
+                                                   dict(bb.DEFAULTS)), ([], {}))
+            probe.assert_not_called()
+
+
+class TestClaudeRegistrySessions(unittest.TestCase):
+    """The registry is what makes liveness exact instead of inferred."""
+
+    def read(self, store, now=1_000_000):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sessions.json")
+            with open(path, "w") as f:
+                json.dump(store, f)
+            with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH", path):
+                return bb.claude_registry_sessions(now, stale_min=30)
+
+    def test_fresh_kept_stale_dropped_newest_first(self):
+        now = 1_000_000
+        got = self.read({"sessions": {
+            "older": {"captured_at": now - 600},
+            "newest": {"captured_at": now - 60},
+            "expired": {"captured_at": now - 31 * 60},
+        }}, now)
+        self.assertEqual([sid for sid, _ in got], ["newest", "older"])
+
+    def test_missing_file_is_unknown_not_empty(self):
+        """None routes to the process-probe fallback; an empty list would wrongly
+        claim the bridge had reported nothing open."""
+        with mock.patch.object(bb, "CLAUDE_SESSIONS_PATH", "/nonexistent/x.json"):
+            self.assertIsNone(bb.claude_registry_sessions(1_000_000))
+
+    def test_garbage_file_is_unknown(self):
+        self.assertIsNone(self.read({"sessions": "not-a-dict"}))
+
+
+class TestLiveClaudeSessionIds(unittest.TestCase):
+    """Cross-checking the registry against the process count. The two signals fail
+    in opposite directions, so each covers the other's blind spot."""
+
+    NOW = 1_000_000
+
+    def resolve(self, reg, proc_count):
+        with mock.patch.object(bb, "claude_registry_sessions", return_value=reg), \
+                mock.patch.object(bb, "claude_proc_count", return_value=proc_count):
+            return bb.live_claude_session_ids(self.NOW)
+
+    def test_closed_tab_is_dropped_once_the_count_disagrees(self):
+        """The reported bug: killing a terminal tab stops the heartbeat, which is
+        indistinguishable from idling until the entry ages out. One live process
+        means only the still-beating session survives."""
+        got = self.resolve([("active", self.NOW - 3),
+                            ("killed", self.NOW - 21 * 60)], 1)
+        self.assertEqual(got, {"active"})
+
+    def test_a_recent_heartbeat_outranks_the_process_count(self):
+        """Process enumeration can be restricted — under a sandbox pgrep misses even
+        the CLI hosting the caller — so a count of zero must never veto a session we
+        heard from seconds ago."""
+        got = self.resolve([("active", self.NOW - 3)], 0)
+        self.assertEqual(got, {"active"})
+
+    def test_quiet_sessions_are_kept_when_the_count_backs_them(self):
+        got = self.resolve([("active", self.NOW - 3),
+                            ("idle", self.NOW - 21 * 60)], 2)
+        self.assertEqual(got, {"active", "idle"})
+
+    def test_quiet_sessions_are_taken_newest_first(self):
+        got = self.resolve([("recent_idle", self.NOW - 10 * 60),
+                            ("older_idle", self.NOW - 25 * 60)], 1)
+        self.assertEqual(got, {"recent_idle"})
+
+    def test_unreadable_process_table_trusts_the_registry(self):
+        got = self.resolve([("a", self.NOW - 3), ("b", self.NOW - 21 * 60)], None)
+        self.assertEqual(got, {"a", "b"})
+
+    def test_no_registry_is_unknown(self):
+        self.assertIsNone(self.resolve(None, 1))
+
+
+class TestMenuRendering(unittest.TestCase):
+    """The redesign is about output shape, so assert on the emitted menu itself."""
+
+    NOW = 1_000_000
+
+    @staticmethod
+    def render(fn, *a, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*a, **kw)
+        return buf.getvalue()
+
+    def test_agents_carry_a_provider_icon_and_advice_line(self):
+        cfg = dict(bb.DEFAULTS)
+        mains = [("s1", {"model": "claude-sonnet-5", "last_ctx": 150_000,
+                         "peak_ctx": 150_000, "mtime": self.NOW, "title": "Deep"})]
+        cursor = [("c1", {"session_name": "Hot", "captured_at": self.NOW,
+                          "context_window": {"used_percentage": 20,
+                                             "context_window_size": 256_000}}, 20.0)]
+        rows = bb.unified_agent_rows(
+            bb.claude_agent_rows({"mains": mains}, cfg, self.NOW)
+            + bb.cursor_agent_rows({"ctx_rows": cursor}, cfg, self.NOW))
+        out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+        self.assertIn(f"sfimage={bb.AGENT_ICON['claude']}", out)
+        self.assertIn(f"sfimage={bb.AGENT_ICON['cursor']}", out)
+        self.assertIn("LIVE AGENTS · 2", out)
+        # 150K on 200K bands is rot -> the one actionable line shows up.
+        self.assertIn("/compact", out)
+
+    def test_no_advice_line_when_everything_is_healthy(self):
+        cfg = dict(bb.DEFAULTS)
+        mains = [("s1", {"model": "claude-sonnet-5", "last_ctx": 5_000,
+                         "peak_ctx": 5_000, "mtime": self.NOW, "title": "Calm"})]
+        rows = bb.unified_agent_rows(bb.claude_agent_rows({"mains": mains}, cfg,
+                                                          self.NOW))
+        out = self.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+        self.assertIn("LIVE AGENTS · 1", out)
+        self.assertNotIn("/compact", out)
+        self.assertNotIn("exclamationmark", out)
+
+    def test_subagents_stay_in_the_main_menu(self):
+        """They must render as sibling rows, not a submenu of the parent: a subagent
+        burning context is the last thing that should need a hover to discover."""
+        cfg = dict(bb.DEFAULTS)
+        mains = [("p", {"model": "claude-opus-5", "last_ctx": 1_000, "peak_ctx": 1_000,
+                        "mtime": self.NOW, "title": "Parent"})]
+        kids = {"p": [("a", {"model": "claude-haiku-4-5", "last_ctx": 2_000,
+                             "peak_ctx": 2_000, "mtime": self.NOW,
+                             "agent_id": "aaaa"})]}
+        rows = bb.unified_agent_rows(bb.claude_agent_rows({"mains": mains}, cfg,
+                                                          self.NOW))
+        out = self.render(bb.emit_agents, rows, kids, self.NOW, cfg)
+        kid_line = [ln for ln in out.splitlines() if "haiku" in ln][0]
+        self.assertFalse(kid_line.startswith("--"))
+        self.assertIn(f"sfimage={bb.SUBAGENT_ICON}", kid_line)
+
+    def test_stats_submenu_is_absent_on_a_fresh_install(self):
+        """cdata is a fully-populated dict of zeroes before you have run anything;
+        the Stats row must not appear and lead to empty headers."""
+        empty_cursor = {"sessions": [], "today_turns": 0, "today_sessions": 0,
+                        "live": None, "session_map": {}, "n_sessions": 0}
+        out = self.render(bb.stats_submenu, None, None, {"cursor": empty_cursor},
+                          datetime.now(timezone.utc).date(), timezone.utc, self.NOW)
+        self.assertEqual(out, "")
+
+
+class TestContextBands(unittest.TestCase):
+    def test_bands_200k_class(self):
+        for tokens, tier, label in ((0, 0, "sharp"), (31_999, 0, "sharp"),
+                                    (32_000, 1, "drifting"), (60_000, 2, "degraded"),
+                                    (128_000, 3, "rot"), (190_000, 3, "rot")):
+            self.assertEqual(bb.ctx_band(tokens, 200_000), (tier, label), tokens)
+
+    def test_bands_scale_with_window(self):
+        """The 1M correction: a model built for 1M isn't judged by 200K's ruler."""
+        self.assertEqual(bb.ctx_band(33_000, 1_000_000), (0, "sharp"))
+        self.assertEqual(bb.ctx_band(33_000, 200_000), (1, "drifting"))
+        self.assertEqual(bb.ctx_band(150_000, 1_000_000), (1, "drifting"))
+        self.assertEqual(bb.ctx_band(150_000, 200_000), (3, "rot"))
+        # ...but a 1M window is still not 1M of usable context.
+        self.assertEqual(bb.ctx_band(450_000, 1_000_000), (3, "rot"))
+
+    def test_unknown_window_falls_back_to_strictest(self):
+        self.assertEqual(bb.ctx_band(70_000, None), (2, "degraded"))
+        self.assertEqual(bb.ctx_band(70_000, 0), (2, "degraded"))
+
+    def test_tags_carry_both_signals(self):
+        tier, tags = bb.ctx_tags(150_000, 95.0, 200_000)
+        self.assertEqual(tier, 3)
+        self.assertEqual(tags, ["rot", "compacting"])
+        tier, tags = bb.ctx_tags(5_000, 92.0, 200_000)   # tiny context, full window
+        self.assertEqual(tier, 0)
+        self.assertEqual(tags, ["compacting"])
+        self.assertEqual(bb.ctx_tags(1_000, 10.0, 200_000), (0, []))
+
+    def test_cursor_ctx_tokens(self):
+        e = {"context_window": {"used_percentage": 61.9, "context_window_size": 256_000}}
+        self.assertEqual(bb.cursor_ctx_tokens(e), 158_464)
+        self.assertIsNone(bb.cursor_ctx_tokens({"context_window": {}}))
+        self.assertIsNone(bb.cursor_ctx_tokens({}))
+
+
+class TestCursorSessionsBridge(unittest.TestCase):
+    def test_statusline_merges_sessions(self):
+        """Load the Cursor statusline module and ensure multi-session merge works."""
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "burnbar-cursor-statusline.py")
+        spec = importlib.util.spec_from_file_location("bb_cursor_sl", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            live = os.path.join(tmp, "live.json")
+            sess = os.path.join(tmp, "sessions.json")
+            mod.LIVE_PATH = live
+            mod.SESSIONS_PATH = sess
+            import io
+            import contextlib
+            payload1 = json.dumps({
+                "session_id": "s1", "session_name": "One",
+                "model": {"display_name": "Auto"},
+                "context_window": {"used_percentage": 40, "context_window_size": 200000},
+            })
+            payload2 = json.dumps({
+                "session_id": "s2", "session_name": "Two",
+                "model": {"display_name": "Auto"},
+                "context_window": {"used_percentage": 80, "context_window_size": 200000},
+            })
+            for p in (payload1, payload2):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with mock.patch("sys.stdin", io.StringIO(p)):
+                        mod.main()
+            with open(sess) as f:
+                store = json.load(f)
+            self.assertIn("s1", store["sessions"])
+            self.assertIn("s2", store["sessions"])
+            self.assertEqual(store["sessions"]["s2"]["context_window"]["used_percentage"], 80)
+
+    def test_loads_legacy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = os.path.join(tmp, "usage.json")
+            new = os.path.join(tmp, "claude", "usage.json")
+            payload = {"rate_limits": {"five_hour": {"used_percentage": 10,
+                                                     "resets_at": 9_999_999}}}
+            with open(legacy, "w") as f:
+                json.dump(payload, f)
+            old_u, old_l = bb.USAGE_PATH, bb.USAGE_PATH_LEGACY
+            bb.USAGE_PATH, bb.USAGE_PATH_LEGACY = new, legacy
+            try:
+                u = bb.load_usage()
+            finally:
+                bb.USAGE_PATH, bb.USAGE_PATH_LEGACY = old_u, old_l
+            self.assertIsNotNone(u)
+            self.assertEqual(u["rate_limits"]["five_hour"]["used_percentage"], 10)
+            self.assertTrue(os.path.exists(new))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProviderRegistry(unittest.TestCase):
+    """The registry's whole promise is that a new agent is a table entry, not a new
+    branch in every function. These tests register a fake third provider and assert
+    it reaches detection, config, the agent list, TODAY and Settings on its own."""
+
+    NOW = 1_000_000
+
+    def fake(self, key="faketool", label="FakeTool", detected=True):
+        return {
+            "key": key, "label": label, "icon": "chevron.left.forwardslash.chevron.right",
+            "detect": lambda: detected,
+            "gather": lambda now, tz, now_epoch: {"turns": 7},
+            "rows": lambda pdata, cfg, now_epoch: [
+                {"prov": key, "key": "s1", "label": "a session",
+                 "tok": 150_000, "win": 200_000, "pct": 75.0, "age": 5}],
+            "today": lambda pdata: f"{pdata['turns']:>7} turns",
+            "stats": None, "setup": "#opencode",
+        }
+
+    @contextlib.contextmanager
+    def registered(self, extra):
+        """Add a provider the way a contributor would: append to the table."""
+        providers = bb.PROVIDERS + (extra,)
+        defaults = dict(bb.DEFAULTS)
+        defaults[f"provider_{extra['key']}"] = "on"
+        with mock.patch.object(bb, "PROVIDERS", providers), \
+                mock.patch.object(bb, "PROVIDER_KEYS",
+                                  tuple(p["key"] for p in providers)), \
+                mock.patch.object(bb, "DEFAULTS", defaults), \
+                mock.patch.dict(bb.AGENT_LABEL, {extra["key"]: extra["label"]}), \
+                mock.patch.dict(bb.AGENT_ICON, {extra["key"]: extra["icon"]}):
+            yield
+
+    def test_new_provider_is_detected_and_configurable(self):
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            self.assertEqual(cfg["provider_faketool"], "on")
+            self.assertTrue(bb.active_providers(cfg)["faketool"])
+            # ...and can be pinned off without touching the other agents.
+            cfg.update(providers_mode="manual", provider_faketool="off")
+            active = bb.active_providers(cfg)
+            self.assertFalse(active["faketool"])
+            self.assertTrue(active["claude"])
+
+    def test_new_provider_joins_the_shared_agent_list(self):
+        """Its rows get banded, ranked and labelled by the shared pipeline — the
+        75%/200K session outranks a roomy Claude one despite carrying fewer tokens."""
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            mains = [("c1", {"model": "claude-opus-5", "last_ctx": 40_000,
+                             "peak_ctx": 40_000, "mtime": self.NOW, "title": "Roomy"})]
+            rows = bb.unified_agent_rows(
+                bb.claude_agent_rows({"mains": mains}, cfg, self.NOW)
+                + extra["rows"](None, cfg, self.NOW))
+            self.assertEqual([r["prov"] for r in rows], ["faketool", "claude"])
+            self.assertEqual(rows[0]["tier"], 3)          # 150K on 200K bands -> rot
+            out = TestMenuRendering.render(bb.emit_agents, rows, {}, self.NOW, cfg)
+            self.assertIn("FakeTool", out)
+            self.assertIn(f"sfimage={extra['icon']}", out)
+
+    def test_new_provider_gets_a_today_line_and_a_settings_row(self):
+        extra = self.fake()
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            prov = bb.active_providers(cfg)
+            # Only the new provider gathers for real; the built-ins would need a
+            # populated ~/.claude and ~/.cursor, which this test isn't about.
+            bundles = {"faketool": extra["gather"](None, None, self.NOW)}
+
+            today = TestMenuRendering.render(bb.emit_today, bundles, None, prov)
+            self.assertIn("FakeTool", today)
+            self.assertIn("7 turns", today)
+            # Its label is padded into the same column as the built-in agents.
+            self.assertRegex(today, r"FakeTool\s+7 turns")
+
+            settings = TestMenuRendering.render(bb.settings_submenu, cfg, prov)
+            self.assertIn("FakeTool", settings)
+            self.assertIn("provider_faketool=off", settings)   # click pins it off
+
+    def test_undetected_provider_stays_out_of_the_menu(self):
+        extra = self.fake(detected=False)
+        with self.registered(extra):
+            cfg = dict(bb.DEFAULTS)
+            bb.migrate_providers(cfg)
+            prov = bb.active_providers(cfg)
+            self.assertFalse(prov["faketool"])
+            self.assertNotIn("FakeTool",
+                             TestMenuRendering.render(bb.emit_today, {}, None, prov))
+
+
+class TestOpenCode(unittest.TestCase):
+    """OpenCode keeps everything in SQLite rather than JSON transcripts, and its
+    context figure is the newest *completed* assistant turn. Both are easy to get
+    wrong, so they're pinned here."""
+
+    NOW = 1_000_000
+
+    def test_turn_context_matches_opencodes_own_sidebar(self):
+        """OpenCode shows `tokens.total` — input + output + cache — so burnbar
+        reports the same number rather than a second, subtly different one. This is
+        the exact turn behind a sidebar reading of 15,507."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"total": 15507, "input": 15133, "output": 374,
+                        "cache": {"read": 0, "write": 0}}}), 15507)
+
+    def test_turn_context_falls_back_to_summing_the_parts(self):
+        """Older rows predate `total`; the parts must add up to the same thing."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"input": 15133, "output": 374,
+                        "cache": {"read": 100, "write": 50}}}), 15657)
+
+    def test_in_flight_turn_reports_zero(self):
+        """A turn still streaming has all-zero tokens; it must not be mistaken for
+        an empty context — the caller keeps walking back to the completed one."""
+        self.assertEqual(bb.opencode_turn_context(
+            {"tokens": {"input": 0, "output": 0, "cache": {"read": 0, "write": 0}}}), 0)
+        self.assertEqual(bb.opencode_turn_context({}), 0)
+
+    def _db(self, tmp, messages):
+        """A minimal OpenCode store: one session plus the given messages."""
+        import sqlite3
+        path = os.path.join(tmp, "opencode.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE session (id TEXT, title TEXT, directory TEXT, "
+                    "model TEXT, time_updated INTEGER, time_archived INTEGER)")
+        con.execute("CREATE TABLE message (id TEXT, session_id TEXT, "
+                    "time_created INTEGER, data TEXT)")
+        con.execute("INSERT INTO session VALUES (?,?,?,?,?,?)",
+                    ("ses_1", "A session", "/w",
+                     json.dumps({"id": "qwen3.6:latest", "providerID": "ollama"}),
+                     int(self.NOW * 1000), None))
+        for i, data in enumerate(messages):
+            con.execute("INSERT INTO message VALUES (?,?,?,?)",
+                        (f"m{i}", "ses_1", int((self.NOW - i) * 1000),
+                         json.dumps(data)))
+        con.commit(); con.close()
+        return path
+
+    def gather(self, messages, win=32_768):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(bb, "OPENCODE_DB", self._db(tmp, messages)), \
+                    mock.patch.object(bb, "opencode_window", return_value=win):
+                now = datetime.fromtimestamp(self.NOW, timezone.utc)
+                return bb.gather_opencode(now, timezone.utc)
+
+    def test_uses_the_newest_completed_turn_not_the_in_flight_one(self):
+        """The bug this guards: the in-flight turn is newest and reports zeros, so
+        reading "the latest turn" literally shows an empty context mid-reply."""
+        data = self.gather([
+            {"role": "assistant", "tokens": {"total": 0, "cache": {}}},        # newest
+            {"role": "user"},
+            {"role": "assistant", "tokens": {"total": 15507, "cache": {}}},
+        ])
+        self.assertEqual(data["sessions"][0]["tok"], 15507)
+
+    def test_rows_carry_percentage_against_the_resolved_window(self):
+        data = self.gather([{"role": "assistant",
+                             "tokens": {"total": 15507, "cache": {}}}])
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            rows = bb.opencode_agent_rows(data, dict(bb.DEFAULTS), self.NOW)
+        self.assertEqual(rows[0]["prov"], "opencode")
+        self.assertEqual(rows[0]["win"], 32_768)
+        self.assertAlmostEqual(rows[0]["pct"], 47.3, places=0)
+
+    def test_unknown_window_claims_no_percentage(self):
+        """Local models aren't in models.dev — OpenCode itself just shows "0% used".
+        Reporting 0% would read as "plenty of room"; None renders as an em dash,
+        and the rot band still works because it reads absolute tokens."""
+        data = self.gather([{"role": "assistant",
+                             "tokens": {"total": 70_000, "cache": {}}}], win=None)
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            rows = bb.unified_agent_rows(
+                bb.opencode_agent_rows(data, dict(bb.DEFAULTS), self.NOW))
+        self.assertIsNone(rows[0]["pct"])
+        self.assertIsNone(rows[0]["win"])
+        self.assertEqual(rows[0]["tier"], 2)          # 70K -> degraded on tokens
+        out = TestMenuRendering.render(bb.emit_agents, rows, {}, self.NOW,
+                                       dict(bb.DEFAULTS))
+        self.assertNotIn("0%", out)
+        self.assertIn("—", out)
+
+    def test_idle_session_is_not_live(self):
+        old = self.NOW - (bb.OPENCODE_STALE_MIN * 60) - 1
+        data = {"sessions": [{"id": "s", "title": "old", "tok": 1000,
+                              "updated": old, "win": 32_768}]}
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            self.assertEqual(bb.opencode_agent_rows(data, dict(bb.DEFAULTS),
+                                                    self.NOW), [])
+
+    def test_missing_database_is_not_an_error(self):
+        with mock.patch.object(bb, "OPENCODE_DB", "/nonexistent/opencode.db"):
+            out = bb.gather_opencode(datetime.now(timezone.utc), timezone.utc)
+        self.assertEqual(out["sessions"], [])
+
+
+class TestWindowResolution(unittest.TestCase):
+    """Hosted models come from the models.dev mirror; local ones from the runtime
+    that loaded them. Order matters — models.dev has no entry for a local model."""
+
+    def test_prefers_models_dev_and_never_calls_ollama(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=200_000), \
+                mock.patch.object(bb, "ollama_context_length") as oll, \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertEqual(bb.opencode_window("anthropic", "claude-haiku-4-5", 0),
+                             200_000)
+            oll.assert_not_called()
+
+    def test_falls_back_to_ollama_for_local_models(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                mock.patch.object(bb, "ollama_context_length", return_value=32_768), \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertEqual(bb.opencode_window("ollama", "qwen3.6:latest", 0), 32_768)
+
+    def test_non_ollama_provider_is_not_probed_locally(self):
+        with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                mock.patch.object(bb, "ollama_context_length") as oll, \
+                mock.patch.object(bb, "_window_cache", return_value={}), \
+                mock.patch.object(bb, "_window_cache_put"):
+            self.assertIsNone(bb.opencode_window("someprovider", "m", 0))
+            oll.assert_not_called()
+
+    def test_cache_hit_skips_both_lookups(self):
+        cache = {"ollama/qwen3.6:latest": {"win": 32_768, "at": 999_999}}
+        with mock.patch.object(bb, "_window_cache", return_value=cache), \
+                mock.patch.object(bb, "models_dev_limit") as mdev:
+            self.assertEqual(bb.opencode_window("ollama", "qwen3.6:latest",
+                                                1_000_000), 32_768)
+            mdev.assert_not_called()
+
+
+class TestModelSwitching(unittest.TestCase):
+    """OpenCode is where models get switched most, and between wildly different
+    windows — a 32K local model and a 1M hosted one. These pin what happens."""
+
+    NOW = 1_000_000
+
+    def session(self, model, provider, win, tok=300_000):
+        return {"sessions": [{"id": "s", "title": "mixed", "tok": tok,
+                              "updated": self.NOW, "win": win,
+                              "model": model, "provider": provider}]}
+
+    def row(self, pdata):
+        with mock.patch.object(bb, "proc_count", return_value=1):
+            return bb.unified_agent_rows(
+                bb.opencode_agent_rows(pdata, dict(bb.DEFAULTS), self.NOW))[0]
+
+    def test_switching_to_a_smaller_model_shows_over_capacity_at_once(self):
+        """The context you're already carrying doesn't shrink when you switch, so
+        moving from a 1M model to a 32K one has to read as a five-alarm fire — that
+        is precisely the moment the warning is worth something."""
+        big = self.row(self.session("claude-sonnet-5", "anthropic", 1_000_000))
+        self.assertAlmostEqual(big["pct"], 30, places=0)
+        self.assertEqual(big["tier"], 2)                      # degraded
+        small = self.row(self.session("qwen3.6:latest", "ollama", 32_768))
+        self.assertEqual(small["pct"], 100.0)                 # clamped, not >100
+        self.assertEqual(small["tier"], 3)                    # rot
+        self.assertIn("compacting", small["tags"])
+
+    def test_row_names_the_model_in_play(self):
+        self.assertEqual(self.row(self.session("qwen3.6:latest", "ollama",
+                                               32_768))["note"], "qwen3.6")
+        self.assertEqual(self.row(self.session("claude-sonnet-5", "anthropic",
+                                               1_000_000))["note"], "sonnet")
+
+    def test_model_label_strips_tags_and_paths(self):
+        self.assertEqual(bb.opencode_model_label("qwen3.6:latest"), "qwen3.6")
+        self.assertEqual(bb.opencode_model_label("qwen/qwen3.6-flash"), "qwen3.6-flash")
+        self.assertEqual(bb.opencode_model_label("claude-opus-5"), "opus")
+        self.assertEqual(bb.opencode_model_label(""), "")
+
+
+class TestWindowCacheAcrossSwitches(unittest.TestCase):
+    """The window cache has to survive model switching, which means distinguishing
+    "this model has no known window" from "the runtime can't answer right now"."""
+
+    NOW = 1_000_000
+
+    @contextlib.contextmanager
+    def cache(self, initial=None):
+        store = dict(initial or {})
+        with mock.patch.object(bb, "_window_cache", lambda: store), \
+                mock.patch.object(
+                    bb, "_window_cache_put",
+                    lambda c, k, w, t: store.__setitem__(k, {"win": w, "at": t})):
+            yield store
+
+    def test_a_miss_expires_quickly(self):
+        """Ollama's /api/ps lists only *loaded* models, so switching to one that
+        hasn't run yet legitimately misses. Caching that for hours would leave the
+        window unknown long after the model loads."""
+        self.assertLess(bb.WINDOW_MISS_TTL, bb.WINDOW_CACHE_TTL / 10)
+        with self.cache({"ollama/m": {"win": None, "at": self.NOW}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length",
+                                      return_value=32_768):
+                stale = self.NOW + bb.WINDOW_MISS_TTL + 1
+                self.assertEqual(bb.opencode_window("ollama", "m", stale), 32_768)
+
+    def test_a_known_window_survives_the_model_going_cold(self):
+        """A local runtime unloads idle models and then can't say what window they
+        had. That's a gap in the answer, not a change to it."""
+        with self.cache({"ollama/m": {"win": 32_768, "at": 0}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length", return_value=None):
+                self.assertEqual(bb.opencode_window("ollama", "m", self.NOW), 32_768)
+
+    def test_a_reloaded_model_can_still_change_the_window(self):
+        """Sticky must not mean stuck: reload with a different -c and it updates."""
+        with self.cache({"ollama/m": {"win": 32_768, "at": 0}}):
+            with mock.patch.object(bb, "models_dev_limit", return_value=None), \
+                    mock.patch.object(bb, "ollama_context_length",
+                                      return_value=131_072):
+                self.assertEqual(bb.opencode_window("ollama", "m", self.NOW), 131_072)
+
+    def test_each_model_is_cached_separately(self):
+        """Switching models must not read the previous model's window."""
+        with self.cache({"ollama/a": {"win": 32_768, "at": self.NOW}}) as store:
+            with mock.patch.object(bb, "models_dev_limit", return_value=200_000):
+                self.assertEqual(bb.opencode_window("anthropic", "b", self.NOW),
+                                 200_000)
+            self.assertEqual(store["ollama/a"]["win"], 32_768)

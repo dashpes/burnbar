@@ -43,17 +43,20 @@ green → yellow → orange → red as it climbs, followed by a reset countdown
 (`3h09m`). One glance tells you how much room you have and how long until it
 clears.
 
-**In the drop-down (click it):** a stats panel with monochrome SF Symbol section
-headers:
+**In the drop-down (click it):** what's happening right now at the top level,
+everything else one hover away, under monochrome SF Symbol section headers:
 
-- **Usage limits (live)** — 5-hour, 7-day, and Opus limits, each a fill bar with
-  the exact percentage used and time to reset.
-- **Today / Last 7 days / All time** — token totals, message and session counts,
-  an hourly-activity sparkline, breakdowns by model, by project, and your top
-  sessions.
-- **Records** — your busiest 5-hour block and busiest day ever.
-- **Settings** — change the theme, switch between the compact and detailed layouts,
-  and tweak the menu-bar bar, all by clicking; no config files to edit.
+- **Live agents** — every running session from every CLI in one list, worst
+  context first. Each row's icon says which tool it belongs to; its colour says
+  how degraded the context is; its bar says how full the window is.
+- **Limits** — 5-hour, 7-day, and Opus limits, each a fill bar with the exact
+  percentage used and time to reset.
+- **Today** — token totals, message and session counts per tool, your git commit
+  count, and an hourly-activity sparkline.
+- **Stats** — a submenu with last 7 days, all-time totals, breakdowns by model,
+  by project, your top sessions, and records (busiest block and busiest day).
+- **Settings** — pick which agents to track, change the theme, tweak the menu
+  bar, all by clicking; no config files to edit.
 
 ---
 
@@ -157,9 +160,30 @@ burnbar is meant to live in the background forever, so resource use mattered.
 - **Settings without a settings window.** Every option is a clickable menu item
   that re-invokes the script to write a small JSON config and refresh — so you
   get a real settings experience with zero native UI code.
-- **Compact vs detailed.** A one-click toggle between the default compact view —
-  just the live limits, today, and a "More stats" submenu — and the full
-  detailed stats panel.
+- **One menu for every agent.** burnbar started as a Claude Code tool, and the
+  first instinct when Cursor arrived was to give it a section of its own. That
+  was wrong: it meant context got printed three times over, and it would have
+  meant a fourth and fifth section as more agents landed. Agents are now entries
+  in a registry, and each one contributes rows to a single shared list — so the
+  menu grows by one row per running session, not one section per vendor.
+- **Knowing which agents are actually open.** Nothing on the outside says so — a
+  CLI doesn't hold its transcript open and the file carries no pid — so burnbar
+  first inferred it from running processes and their working directories. That
+  can't tell two sessions in one directory apart, and it happily listed sessions
+  you'd closed an hour ago. Recording the statusLine heartbeat per session id
+  fixes the identity half — but a closed tab simply stops beating, which reads
+  the same as idling. Neither signal is sufficient alone, and they fail in
+  opposite directions, so burnbar cross-checks them: a heartbeat from the last
+  few minutes is proof on its own, and anything quieter has to be corroborated by
+  the process count. Worth knowing that process enumeration can be restricted —
+  under a sandbox `pgrep` can miss even the CLI hosting the caller — which is
+  exactly why a fresh heartbeat is never allowed to be vetoed by it.
+- **One list, not three.** Context used to be printed three times over — a
+  top-of-menu risk strip, then again inside each tool's own section. Merging every
+  provider into one risk-ranked list said the same thing once, and cut the menu
+  from 83 rows to about a dozen. Provider identity moved to a per-row SF Symbol,
+  because colour was already carrying the context-rot band and one channel can't
+  encode two independent signals.
 
 ---
 
